@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Least-privilege capability set for the LeanAI main window. Deliberately grants no shell execution, no HTTP access and no ambient filesystem read. Project files are read only through LeanAI's own commands, which enforce the approved-root boundary in Rust (backlog 1.4, NFR 7.1).",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "dialog:allow-message",
+    "dialog:allow-confirm",
+    "clipboard-manager:allow-write-text"
+  ]
+}

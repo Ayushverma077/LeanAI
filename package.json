@@ -1,0 +1,57 @@
+{
+  "name": "leanai-desktop",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "LeanAI Desktop - offline-first repository context bundler.",
+  "scripts": {
+    "dev": "tauri dev",
+    "dev:vite": "vite",
+    "build": "npm run typecheck && tauri build",
+    "build:vite": "vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier --write \"src/**/*.{ts,tsx,css}\"",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\"",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:rust": "cargo test --workspace",
+    "check:all": "npm run typecheck && npm run lint && npm run test && npm run test:rust && cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-clipboard-manager": "^2",
+    "@tauri-apps/plugin-dialog": "^2",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.8"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.20.0",
+    "@tailwindcss/vite": "^4.1.0",
+    "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/dom": "^10.4.0",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.2.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/node": "^26.4.1",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "eslint": "^9.20.0",
+    "eslint-plugin-react-hooks": "^5.1.0",
+    "globals": "^17.12.0",
+    "jsdom": "^26.0.0",
+    "prettier": "^3.5.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.24.0",
+    "vite": "^7.0.0",
+    "vitest": "^3.0.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}

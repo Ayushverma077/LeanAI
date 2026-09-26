@@ -1,0 +1,31 @@
+[package]
+name = "leanai-desktop"
+description = "LeanAI Desktop - offline-first repository context bundler."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "leanai_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+leanai-core = { path = "../crates/leanai-core" }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-fs = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"

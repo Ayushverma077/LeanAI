@@ -1,0 +1,23 @@
+[package]
+name = "leanai-core"
+description = "Deterministic scanning, filtering, bundling, token estimation and context indexing for LeanAI Desktop."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+sha2 = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
+regex = { workspace = true }
+tiktoken-rs = { workspace = true }
+once_cell = { workspace = true }
+git2 = { version = "0.20", default-features = false }
+
+[dev-dependencies]
+tempfile = "3"

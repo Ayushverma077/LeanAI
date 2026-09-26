@@ -1,0 +1,167 @@
+@import "tailwindcss";
+
+/* LeanAI — Brand-aligned design tokens.
+   Accent: cyan → blue → purple gradient (matches the logo).
+
+   The `ink-*` scale is defined by ROLE, not by lightness:
+     ink-950  app background      ink-500  muted text / icons
+     ink-900  card surface        ink-400  secondary text
+     ink-850  raised surface      ink-300  body text
+     ink-800  border              ink-200  emphasised text
+     ink-750  strong border       ink-100  headings, strongest text
+     ink-700  border (hover)
+     ink-600  faint text (paths)
+
+   Dark is the default. The light theme below re-points the same tokens, so
+   every component works in both without touching its markup. */
+@theme {
+  /* Surfaces — deep navy base */
+  --color-ink-950: #07071a;
+  --color-ink-900: #0d0d22;
+  --color-ink-850: #111128;
+  --color-ink-800: #18182e;
+  --color-ink-750: #20203a;
+  --color-ink-700: #2a2a46;
+  --color-ink-600: #40405e;
+  --color-ink-500: #606080;
+  --color-ink-400: #8888aa;
+  --color-ink-300: #b8b8cc;
+  --color-ink-200: #dcdce8;
+  --color-ink-100: #f4f4f8;
+
+  /* Brand palette — matches logo gradient */
+  --color-brand: #4b7bff;
+  --color-brand-cyan: #22d3ee;
+  --color-brand-purple: #8b5cf6;
+  --color-brand-light: #6b9fff;
+
+  /* Legacy accent aliases */
+  --color-accent: #4b7bff;
+  --color-accent-hover: #3a6aee;
+  --color-accent-light: #6b9fff;
+  --color-cyan: #22d3ee;
+  --color-purple: #8b5cf6;
+
+  /* Semantic */
+  --color-warn: #f59e0b;
+  --color-danger: #ef4444;
+  --color-ok: #22c55e;
+}
+
+:root {
+  color-scheme: dark;
+  /* Ring used around the logo tile; see `.logo-tile`. */
+  --logo-ring: transparent;
+  --scrollbar-thumb: rgba(75, 123, 255, 0.18);
+  --scrollbar-thumb-hover: rgba(75, 123, 255, 0.35);
+}
+
+/* ── Light theme ─────────────────────────────────────────────────────────────
+   Same roles, re-pointed. The base is a soft blue-grey rather than pure white:
+   the app icon is a white squircle, and on pure white its edge disappears.
+   Every text token below clears 4.5:1 against the surface it sits on. */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --color-ink-950: #f3f5fa;
+  --color-ink-900: #ffffff;
+  --color-ink-850: #fafbfd;
+  --color-ink-800: #e5e8f0;
+  --color-ink-750: #d9dee9;
+  --color-ink-700: #c3cad9;
+  --color-ink-600: #676e83;
+  --color-ink-500: #58607a;
+  --color-ink-400: #4a5268;
+  --color-ink-300: #333b4f;
+  --color-ink-200: #1d2333;
+  --color-ink-100: #0b0f1a;
+
+  /* Saturated blues lose contrast on white, so the brand shifts a step
+     darker. `brand-light` is the hover state and therefore goes *darker* here,
+     because a filled button on a light page should deepen, not wash out. */
+  --color-brand: #3560e8;
+  --color-brand-light: #2a4fcc;
+  --color-brand-cyan: #0891b2;
+  --color-brand-purple: #7c3aed;
+
+  --color-accent: #3560e8;
+  --color-accent-hover: #2a4fcc;
+  --color-accent-light: #2a4fcc;
+  --color-cyan: #0891b2;
+  --color-purple: #7c3aed;
+
+  /* Status colours picked for legibility as text on a light surface. */
+  --color-warn: #b45309;
+  --color-danger: #dc2626;
+  --color-ok: #15803d;
+
+  --logo-ring: rgba(11, 15, 26, 0.1);
+  --scrollbar-thumb: rgba(53, 96, 232, 0.25);
+  --scrollbar-thumb-hover: rgba(53, 96, 232, 0.45);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+  user-select: none;
+}
+
+body {
+  margin: 0;
+  background: var(--color-ink-950);
+  color: var(--color-ink-100);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13px;
+  letter-spacing: -0.012em;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Accessible focus ring — brand blue */
+:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
+
+.mono {
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  letter-spacing: -0.025em;
+}
+
+/* The app icon is a white squircle with its own baked-in drop shadow, drawn
+   inside ~9% transparent padding. Adding a CSS shadow or corner radius to the
+   <img> would frame that transparent box rather than the squircle, which shows
+   up as a misaligned rectangle on a light background. So: no box-shadow here.
+   In light mode a faint inset ring redraws the tile edge that the white-on-
+   near-white pairing loses. */
+.logo-tile {
+  border-radius: 22%;
+  box-shadow: inset 0 0 0 1px var(--logo-ring);
+}
+
+/* Minimal scrollbars */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tauri::State;
 
-use leanai_core::catalog::PriceCatalog;
+use leanai_core::catalog::{CatalogEntry, ModelTier, PriceCatalog, SELF_HOSTED_PROVIDER};
 use leanai_core::provider::{CachedTokenPolicy, CapabilityProfile, TokenCountResult};
 use leanai_core::routing::{
     route_task as core_route_task, RoutingDecision, RoutingPolicy, TaskClass,
@@ -283,8 +283,274 @@ pub async fn check_provider_status(
 }
 
 #[tauri::command]
-pub async fn get_model_catalog() -> AppResult<PriceCatalog> {
-    Ok(PriceCatalog::default())
+pub async fn get_model_catalog(state: State<'_, AppState>) -> AppResult<PriceCatalog> {
+    effective_catalog(&state)
+}
+
+// ---------------------------------------------------------------------------
+// Self-hosted models: user-run OpenAI-compatible servers (Ollama, vLLM,
+// LM Studio, llama.cpp) on this or another machine. Stored under their own
+// settings key; API keys, when a server needs one, live in the keychain.
+// ---------------------------------------------------------------------------
+
+const SELF_HOSTED_KEY: &str = "self_hosted_models.v1";
+
+/// A user-registered model behind an OpenAI-compatible API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfHostedModel {
+    /// Stable slug; the catalog ID is `custom/{id}`.
+    pub id: String,
+    pub display_name: String,
+    /// What the user entered, e.g. `http://192.168.1.20:11434`.
+    pub base_url: String,
+    /// Model name the server expects, e.g. `qwen3:14b`.
+    pub model: String,
+    /// How capable the user judges it; drives routing.
+    pub tier: ModelTier,
+    pub context_cap: usize,
+    #[serde(default)]
+    pub has_api_key: bool,
+}
+
+impl SelfHostedModel {
+    fn keychain_id(&self) -> String {
+        format!("{SELF_HOSTED_PROVIDER}-{}", self.id)
+    }
+
+    fn catalog_entry(&self) -> CatalogEntry {
+        CatalogEntry::self_hosted(
+            &self.id,
+            &self.display_name,
+            &self.model,
+            self.context_cap,
+            self.tier,
+        )
+    }
+}
+
+pub fn load_self_hosted(state: &AppState) -> AppResult<Vec<SelfHostedModel>> {
+    let raw = state.with_db(|conn| repositories::get_setting(conn, SELF_HOSTED_KEY))?;
+    Ok(raw
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default())
+}
+
+pub fn store_self_hosted(state: &AppState, models: &[SelfHostedModel]) -> AppResult<()> {
+    let json = serde_json::to_string(models).map_err(|e| AppError::internal(e.to_string()))?;
+    state.with_db(|conn| repositories::set_setting(conn, SELF_HOSTED_KEY, &json))
+}
+
+/// Built-in catalog plus the user's self-hosted models. This is the catalog
+/// the prompt router chooses from.
+pub(crate) fn effective_catalog(state: &AppState) -> AppResult<PriceCatalog> {
+    let mut catalog = PriceCatalog::default_catalog();
+    catalog.entries.extend(
+        load_self_hosted(state)?
+            .iter()
+            .map(SelfHostedModel::catalog_entry),
+    );
+    Ok(catalog)
+}
+
+/// Endpoint for a self-hosted catalog entry (`custom/{id}`).
+pub(crate) fn self_hosted_endpoint(
+    state: &AppState,
+    model_id: &str,
+) -> AppResult<crate::llm_client::Endpoint> {
+    let id = model_id
+        .strip_prefix(&format!("{SELF_HOSTED_PROVIDER}/"))
+        .unwrap_or(model_id);
+    let model = load_self_hosted(state)?
+        .into_iter()
+        .find(|m| m.id == id)
+        .ok_or_else(|| AppError::new("model_not_found", "That self-hosted model was removed."))?;
+    let api_key = if model.has_api_key {
+        state.keychain.read(&model.keychain_id())?
+    } else {
+        None
+    };
+    Ok(crate::llm_client::Endpoint::SelfHosted {
+        url: crate::llm_client::chat_completions_url(&model.base_url)?,
+        api_key,
+    })
+}
+
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    let out = out
+        .trim_end_matches('-')
+        .chars()
+        .take(32)
+        .collect::<String>();
+    if out.is_empty() {
+        "model".to_string()
+    } else {
+        out
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveSelfHostedModelRequest {
+    /// Present when editing an existing entry.
+    pub id: Option<String>,
+    pub display_name: String,
+    pub base_url: String,
+    pub model: String,
+    pub tier: ModelTier,
+    pub context_cap: Option<usize>,
+    /// New key to store. `None` keeps the current one.
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub clear_api_key: bool,
+}
+
+#[tauri::command]
+pub async fn list_self_hosted_models(
+    state: State<'_, AppState>,
+) -> AppResult<Vec<SelfHostedModel>> {
+    load_self_hosted(&state)
+}
+
+#[tauri::command]
+pub async fn save_self_hosted_model(
+    state: State<'_, AppState>,
+    request: SaveSelfHostedModelRequest,
+) -> AppResult<SelfHostedModel> {
+    let display_name = request.display_name.trim().to_string();
+    let model_name = request.model.trim().to_string();
+    if display_name.is_empty() || model_name.is_empty() {
+        return Err(AppError::new(
+            "invalid_model",
+            "Enter a display name and the model name the server expects.",
+        ));
+    }
+    // Validates the address before anything is stored.
+    crate::llm_client::chat_completions_url(&request.base_url)?;
+    let context_cap = request
+        .context_cap
+        .unwrap_or(32_768)
+        .clamp(2_048, 2_000_000);
+
+    let mut models = load_self_hosted(&state)?;
+    let id = match &request.id {
+        Some(id) if models.iter().any(|m| &m.id == id) => id.clone(),
+        Some(_) => {
+            return Err(AppError::new(
+                "model_not_found",
+                "That model no longer exists.",
+            ))
+        }
+        None => {
+            let base = slug(&display_name);
+            let mut candidate = base.clone();
+            let mut n = 2;
+            while models.iter().any(|m| m.id == candidate) {
+                candidate = format!("{base}-{n}");
+                n += 1;
+            }
+            candidate
+        }
+    };
+    let previous_key = models
+        .iter()
+        .find(|m| m.id == id)
+        .is_some_and(|m| m.has_api_key);
+    let mut model = SelfHostedModel {
+        id,
+        display_name,
+        base_url: request.base_url.trim().to_string(),
+        model: model_name,
+        tier: request.tier,
+        context_cap,
+        has_api_key: previous_key,
+    };
+
+    match request.api_key.as_deref().map(str::trim) {
+        Some(key) if !key.is_empty() => {
+            state.keychain.store(&model.keychain_id(), "api_key", key)?;
+            model.has_api_key = true;
+        }
+        _ if request.clear_api_key => {
+            let _ = state.keychain.delete(&model.keychain_id());
+            model.has_api_key = false;
+        }
+        _ => {}
+    }
+
+    models.retain(|m| m.id != model.id);
+    models.push(model.clone());
+    store_self_hosted(&state, &models)?;
+    Ok(model)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfHostedModelIdRequest {
+    pub id: String,
+}
+
+#[tauri::command]
+pub async fn delete_self_hosted_model(
+    state: State<'_, AppState>,
+    request: SelfHostedModelIdRequest,
+) -> AppResult<bool> {
+    let mut models = load_self_hosted(&state)?;
+    let Some(model) = models.iter().find(|m| m.id == request.id).cloned() else {
+        return Ok(false);
+    };
+    if model.has_api_key {
+        let _ = state.keychain.delete(&model.keychain_id());
+    }
+    models.retain(|m| m.id != request.id);
+    store_self_hosted(&state, &models)?;
+    Ok(true)
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelfHostedTestResult {
+    pub latency_ms: u64,
+    pub reply: String,
+}
+
+/// Sends a tiny request so the user knows the address, model name and key
+/// work before a real task depends on them.
+#[tauri::command]
+pub async fn test_self_hosted_model(
+    state: State<'_, AppState>,
+    request: SelfHostedModelIdRequest,
+) -> AppResult<SelfHostedTestResult> {
+    let model = load_self_hosted(&state)?
+        .into_iter()
+        .find(|m| m.id == request.id)
+        .ok_or_else(|| AppError::new("model_not_found", "That self-hosted model was removed."))?;
+    let endpoint = self_hosted_endpoint(&state, &model.id)?;
+    let started = std::time::Instant::now();
+    let reply = crate::llm_client::complete(
+        &endpoint,
+        &model.model,
+        "Reply with the single word OK.",
+        &[crate::llm_client::ChatMessage {
+            role: "user",
+            content: "Connection test.".to_string(),
+        }],
+        512,
+        None,
+    )
+    .await?;
+    Ok(SelfHostedTestResult {
+        latency_ms: started.elapsed().as_millis() as u64,
+        reply: reply.text.chars().take(200).collect(),
+    })
 }
 
 #[tauri::command]

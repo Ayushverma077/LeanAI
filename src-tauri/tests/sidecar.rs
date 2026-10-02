@@ -50,28 +50,42 @@ fn sidecar_lifecycle_with_mock_loopback_binary() {
     let bytes = create_synthetic_gguf(3, 10, 1);
     std::fs::write(model_file.path(), bytes).unwrap();
 
-    // Create a mock executable script that simulates the llama-server interface
+    // Build a native mock so the same lifecycle is exercised on Windows and
+    // Unix. Bind the requested port to exercise the real readiness check.
     let temp_dir = tempfile::tempdir().unwrap();
-    let script_path = temp_dir.path().join("mock_llama_server");
-    let script_content = r#"#!/usr/bin/env python3
-import sys, time
-# Simulates long-running background sidecar process
-while True:
-    time.sleep(1)
-"#;
-    std::fs::write(&script_path, script_content).unwrap();
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script_path, perms).unwrap();
+    let source_path = temp_dir.path().join("mock_llama_server.rs");
+    let binary_path = temp_dir
+        .path()
+        .join(format!("mock_llama_server{}", std::env::consts::EXE_SUFFIX));
+    let source = r#"
+fn main() {
+    let mut args = std::env::args();
+    let port = loop {
+        if args.next().as_deref() == Some("--port") {
+            break args.next().unwrap().parse::<u16>().unwrap();
+        }
+    };
+    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+    for stream in listener.incoming() {
+        drop(stream.unwrap());
     }
+}
+"#;
+    std::fs::write(&source_path, source).unwrap();
+    let build = std::process::Command::new("rustc")
+        .arg(&source_path)
+        .arg("-o")
+        .arg(&binary_path)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "mock compilation failed: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
 
     let manager = SidecarManager::new();
-    manager.set_binary_override(Some(script_path));
-    manager.set_mock_healthy(true);
+    manager.set_binary_override(Some(binary_path));
 
     assert_eq!(manager.status(), SidecarStatus::Stopped);
 
@@ -85,7 +99,7 @@ while True:
         )
         .unwrap();
 
-    let pid = match status {
+    let port = match status {
         SidecarStatus::Ready {
             port,
             pid,
@@ -96,7 +110,7 @@ while True:
             assert!(pid > 0);
             assert_eq!(model_id, "test-model");
             assert_eq!(display_name, "Synthetic Llama");
-            pid
+            port
         }
         other => panic!("Expected Ready status, got {other:?}"),
     };
@@ -108,18 +122,7 @@ while True:
     assert_eq!(stopped, SidecarStatus::Stopped);
     assert_eq!(manager.status(), SidecarStatus::Stopped);
 
-    // Verify process was terminated and no orphan was left
-    #[cfg(unix)]
-    {
-        let check = std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .status();
-        if let Ok(c) = check {
-            assert!(
-                !c.success(),
-                "Process {pid} should not be running after stop()"
-            );
-        }
-    }
+    // The listener belongs to the child, so a successful connection would
+    // mean stop left the mock running. This check works on both platforms.
+    assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
 }

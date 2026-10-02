@@ -18,8 +18,19 @@ import { GitSyncModal } from "../git/GitSyncModal";
 import { CloneRepoModal } from "../git/CloneRepoModal";
 
 export function TopBar({ onOpenCommandPalette }: { onOpenCommandPalette: () => void }) {
-  const { project, git, remoteStatus, scanning, scan, openProject, bundle, setRoute, theme, toggleTheme } =
-    useAppStore();
+  const {
+    project,
+    git,
+    remoteStatus,
+    scanning,
+    preparingMap,
+    scan,
+    openProject,
+    bundle,
+    setRoute,
+    theme,
+    toggleTheme,
+  } = useAppStore();
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [showCloneModal, setShowCloneModal] = useState(false);
 
@@ -127,11 +138,7 @@ export function TopBar({ onOpenCommandPalette }: { onOpenCommandPalette: () => v
             <div className="h-1 w-16 overflow-hidden rounded-full bg-ink-800">
               <div
                 className={`h-full rounded-full transition-all duration-300 ${
-                  tokenPct < 50
-                    ? "bg-brand"
-                    : tokenPct < 80
-                      ? "bg-warn"
-                      : "bg-danger"
+                  tokenPct < 50 ? "bg-brand" : tokenPct < 80 ? "bg-warn" : "bg-danger"
                 }`}
                 style={{ width: `${Math.max(tokenPct, tokenEstimate > 0 ? 3 : 0)}%` }}
               />
@@ -147,11 +154,14 @@ export function TopBar({ onOpenCommandPalette }: { onOpenCommandPalette: () => v
           <Button
             variant="ghost"
             size="xs"
-            disabled={scanning}
+            disabled={scanning || preparingMap}
             onClick={scan}
-            title="Rescan (⌘R)"
+            title={preparingMap ? "Building the project map…" : "Rescan (⌘R)"}
           >
-            <RefreshCwIcon size={12} className={scanning ? "animate-spin text-brand" : ""} />
+            <RefreshCwIcon
+              size={12}
+              className={scanning || preparingMap ? "animate-spin text-brand" : ""}
+            />
           </Button>
         )}
 

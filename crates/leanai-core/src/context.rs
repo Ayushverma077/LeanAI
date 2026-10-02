@@ -8,29 +8,44 @@ use crate::classify::FileClass;
 use crate::error::Result;
 use crate::inventory::Inventory;
 use crate::project;
-use crate::symbols::{self, RouteDeclaration, SymbolKind};
+use crate::symbols::{self, RouteDeclaration};
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// Version 2 is the short format (ADR 0014). Stored documents with another
+/// version are regenerated rather than shown.
+pub const SCHEMA_VERSION: u32 = 2;
 pub const DOCUMENT_NAME: &str = "PROJECT_CONTEXT.md";
+/// First characters of the comment every rendered file carries. A file with it
+/// was written by LeanAI; a file without it was not.
+pub const FILE_MARKER: &str = "<!-- leanai.context/v";
 
-/// The section keys required by Instructions §8.3, in render order.
+/// The document's sections, in render order.
+///
+/// Kept short on purpose (ADR 0014): the file is what a person or a model reads
+/// first, so every section is a few plain lines. Each section still records its
+/// sources, content hashes, freshness and limitations in the stored document,
+/// and the app shows them; they are not repeated in the file.
 pub const SECTION_KEYS: &[(&str, &str)] = &[
-    ("metadata", "Metadata and freshness"),
-    ("quick_reference", "Quick Reference"),
-    ("summary", "Project Summary"),
-    ("directory_structure", "Directory Structure"),
-    ("file_inventory", "File Inventory"),
-    ("core_architecture", "Core Architecture"),
+    ("overview", "Overview"),
+    ("structure", "Structure"),
     ("key_modules", "Key Modules"),
-    ("api_contracts", "API Contracts"),
+    ("api_contracts", "API Routes"),
     ("dependencies", "Dependencies"),
-    ("workflows", "Workflows"),
+    ("workflows", "How to Run"),
     ("configuration", "Configuration"),
-    ("known_issues", "Known Issues and TODOs"),
-    ("notes_and_decisions", "Notes and Decisions"),
-    ("agent_task_history", "Agent Task History"),
-    ("source_references", "Source References and Change Impact"),
+    ("known_issues", "Open TODOs"),
+    ("notes_and_decisions", "Decisions"),
 ];
+
+/// Sections that describe the file set as a whole. A new file can make them
+/// wrong without changing any file they cite, so any addition makes them stale.
+const STRUCTURAL_SECTIONS: &[&str] = &["overview", "structure"];
+
+/// Most items shown in one rendered list; the rest are counted, not listed.
+const LIST_CAP: usize = 12;
+/// Most files listed under Key Modules.
+const MODULE_CAP: usize = 20;
+/// Most exported names shown per key module.
+const NAMES_PER_MODULE: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -131,6 +146,9 @@ impl ContextSection {
 pub struct ContextDocument {
     pub schema_version: u32,
     pub project_fingerprint: String,
+    /// Name of the project directory, used as the document title.
+    #[serde(default)]
+    pub project_name: String,
     pub source_revision: String,
     pub generated_at_ms: u64,
     /// SHA-256 of the rendered markdown.
@@ -226,10 +244,7 @@ pub fn apply_change_impact(document: &mut ContextDocument, inventory: &Inventory
     for section in &mut document.sections {
         // A new file can invalidate any structural claim, so structural
         // sections go stale when the file set changes at all.
-        let structural = matches!(
-            section.key.as_str(),
-            "directory_structure" | "file_inventory" | "core_architecture" | "source_references"
-        );
+        let structural = STRUCTURAL_SECTIONS.contains(&section.key.as_str());
         let touched = section
             .source_refs
             .iter()
@@ -264,8 +279,6 @@ pub struct GenerateOptions {
     /// Cap on files read for symbol extraction. Keeps generation bounded on
     /// large repositories.
     pub max_analyzed_files: usize,
-    /// Cap on rows in the File Inventory table.
-    pub max_inventory_rows: usize,
     /// Cap on TODO findings.
     pub max_todos: usize,
 }
@@ -274,7 +287,6 @@ impl Default for GenerateOptions {
     fn default() -> Self {
         Self {
             max_analyzed_files: 1_500,
-            max_inventory_rows: 400,
             max_todos: 200,
         }
     }
@@ -301,26 +313,24 @@ pub fn generate(
     let revision = &inventory.source_revision;
 
     let sections = vec![
-        section_metadata(inventory, &analysis, revision),
-        section_quick_reference(inventory, &analysis, revision),
-        section_summary(&root, inventory, revision),
-        section_directory_structure(inventory, revision),
-        section_file_inventory(inventory, options, revision),
-        section_core_architecture(inventory, &analysis, revision),
+        section_overview(&root, inventory, &analysis, revision),
+        section_structure(inventory, revision),
         section_key_modules(inventory, &analysis, revision),
         section_api_contracts(inventory, &analysis, revision),
         section_dependencies(&root, inventory, revision),
         section_workflows(&root, inventory, revision),
         section_configuration(inventory, &analysis, revision),
-        section_known_issues(inventory, &analysis, revision),
-        section_notes_and_decisions(inventory, revision),
-        section_agent_task_history(revision),
-        section_source_references(inventory, &analysis, revision),
+        section_known_issues(inventory, &analysis, options, revision),
+        section_notes_and_decisions(&root, inventory, revision),
     ];
 
     let mut document = ContextDocument {
         schema_version: SCHEMA_VERSION,
         project_fingerprint: inventory.project_fingerprint.clone(),
+        project_name: root
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default(),
         source_revision: revision.clone(),
         generated_at_ms: project::now_ms(),
         content_hash: String::new(),
@@ -339,8 +349,12 @@ fn analyze(root: &Path, inventory: &Inventory, options: &GenerateOptions) -> Ana
         unanalyzed: Vec::new(),
         truncated: false,
     };
-    let todo_pattern =
-        regex::Regex::new(r"\b(TODO|FIXME|HACK|XXX|BUG)\b[:\s-]*(.{0,160})").unwrap();
+    // Markers count only at the start of a comment, so the word "TODO" inside
+    // a string, a regex or prose is not reported.
+    let todo_pattern = regex::Regex::new(
+        r"(?:^|\s)(?://+|#+|/\*+|\*|<!--|--|;+)\s*(TODO|FIXME|HACK|XXX|BUG)\b[:\s-]*(.{0,160})",
+    )
+    .unwrap();
     let env_pattern = regex::Regex::new(
         r#"(?:process\.env\.([A-Z_][A-Z0-9_]*)|process\.env\[['"]([A-Z_][A-Z0-9_]*)['"]\]|os\.environ(?:\.get)?[\[(]\s*['"]([A-Z_][A-Z0-9_]*)['"]|std::env::var\(\s*"([A-Z_][A-Z0-9_]*)"|getenv\(\s*"([A-Z_][A-Z0-9_]*)")"#,
     )
@@ -396,131 +410,80 @@ fn analyze(root: &Path, inventory: &Inventory, options: &GenerateOptions) -> Ana
     analysis
 }
 
-fn section_metadata(inventory: &Inventory, analysis: &Analysis, revision: &str) -> ContextSection {
-    let counts = inventory.class_counts();
-    let mut body = String::new();
-    body.push_str(&format!(
-        "- **Project fingerprint:** `{}`\n",
-        inventory.project_fingerprint
-    ));
-    body.push_str(&format!("- **Source revision:** `{revision}`\n"));
-    body.push_str(&format!("- **Context schema:** `v{SCHEMA_VERSION}`\n"));
-    body.push_str(&format!(
-        "- **Policy version:** `v{}`\n",
-        inventory.policy_version
-    ));
-    body.push_str(&format!(
-        "- **Files scanned:** {}\n",
-        inventory.stats.files_seen
-    ));
-    body.push_str(&format!(
-        "- **Files eligible for context:** {}\n",
-        inventory.selectable().count()
-    ));
-    body.push_str(&format!(
-        "- **Files analysed for symbols:** {}\n",
-        analysis.files.len()
-    ));
-    body.push_str("\n**Classification breakdown**\n\n| Class | Files |\n| --- | ---: |\n");
-    for (label, count) in counts {
-        body.push_str(&format!("| {label} | {count} |\n"));
+/// `` `a`, `b`, `c` (+N more) ``: at most `cap` items, the rest counted.
+fn capped_list<S: AsRef<str>>(items: &[S], cap: usize) -> String {
+    let mut out = items
+        .iter()
+        .take(cap)
+        .map(|item| format!("`{}`", item.as_ref()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if items.len() > cap {
+        out.push_str(&format!(" (+{} more)", items.len() - cap));
     }
-    body.push_str(
-        "\n> This document is an index over the source, not a replacement for it. Every claim below links to the file it came from; fetch the current source before relying on a detail.\n",
-    );
-
-    let mut limitations = vec![
-        "Generated deterministically from file contents. No model reviewed these claims."
-            .to_string(),
-    ];
-    if inventory.stats.truncated {
-        limitations.push(
-            "The scan hit its file limit, so the project is only partly represented.".to_string(),
-        );
-    }
-    if analysis.truncated {
-        limitations.push("Symbol analysis stopped at the configured file cap.".to_string());
-    }
-    ContextSection::deterministic(
-        "metadata",
-        "Metadata and freshness",
-        body,
-        Vec::new(),
-        limitations,
-        revision,
-    )
+    out
 }
 
-fn section_quick_reference(
+fn source(inventory: &Inventory, path: &str) -> Option<SourceRef> {
+    inventory
+        .get(path)
+        .map(|entry| SourceRef::file(path, entry.content_hash.clone()))
+}
+
+fn read_text(root: &Path, path: &str) -> String {
+    project::resolve_within_root(root, path)
+        .ok()
+        .and_then(|absolute| std::fs::read_to_string(absolute).ok())
+        .unwrap_or_default()
+}
+
+/// Test code: left out of Key Modules and API Routes, which describe the
+/// product itself.
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let in_test_dir = lower
+        .split('/')
+        .rev()
+        .skip(1)
+        .any(|dir| matches!(dir, "test" | "tests" | "__tests__" | "spec" | "fixtures"));
+    in_test_dir
+        || name.contains(".test.")
+        || name.contains(".spec.")
+        || name.starts_with("test_")
+        || name.ends_with("_test.go")
+        || name.ends_with("_test.py")
+        || name.ends_with("_test.rs")
+}
+
+fn plural(count: usize, word: &str) -> String {
+    format!("{count} {word}{}", if count == 1 { "" } else { "s" })
+}
+
+const ENTRY_POINTS: &[&str] = &[
+    "src/main.rs",
+    "src/lib.rs",
+    "main.py",
+    "src/index.ts",
+    "src/index.tsx",
+    "src/main.ts",
+    "src/main.tsx",
+    "src/App.tsx",
+    "index.js",
+    "app.py",
+    "manage.py",
+    "cmd/main.go",
+    "main.go",
+];
+
+/// What the project is: the README's first paragraph, languages, entry points
+/// and how many files the index covers.
+fn section_overview(
+    root: &Path,
     inventory: &Inventory,
     analysis: &Analysis,
     revision: &str,
 ) -> ContextSection {
-    let mut refs = Vec::new();
-    let mut body = String::new();
-
-    let entry_candidates = [
-        "src/main.rs",
-        "src/lib.rs",
-        "main.py",
-        "src/index.ts",
-        "src/index.tsx",
-        "src/main.ts",
-        "src/main.tsx",
-        "src/App.tsx",
-        "index.js",
-        "app.py",
-        "manage.py",
-        "cmd/main.go",
-        "main.go",
-    ];
-    let found: Vec<&str> = entry_candidates
-        .into_iter()
-        .filter(|candidate| inventory.get(candidate).is_some())
-        .collect();
-
-    body.push_str("**Likely entry points**\n\n");
-    if found.is_empty() {
-        body.push_str("_None of the conventional entry-point paths were found. Check the build configuration._\n");
-    } else {
-        for path in &found {
-            body.push_str(&format!("- `{path}`\n"));
-            if let Some(entry) = inventory.get(path) {
-                refs.push(SourceRef::file(path, entry.content_hash.clone()));
-            }
-        }
-    }
-
-    body.push_str("\n**Largest analysed files**\n\n");
-    let mut by_size: Vec<_> = inventory.selectable().collect();
-    by_size.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes).then(a.path.cmp(&b.path)));
-    for entry in by_size.iter().take(5) {
-        body.push_str(&format!(
-            "- `{}` ({})\n",
-            entry.path,
-            crate::walker::human_bytes(entry.size_bytes)
-        ));
-    }
-
-    let exported: usize = analysis
-        .files
-        .iter()
-        .flat_map(|file| file.symbols.iter())
-        .filter(|symbol| symbol.exported)
-        .count();
-    body.push_str(&format!("\n**Exported declarations found:** {exported}\n"));
-
-    ContextSection::deterministic(
-        "quick_reference",
-        "Quick Reference",
-        body,
-        refs,
-        vec!["Entry points are matched by conventional filename, not by parsing the build configuration.".to_string()],
-        revision,
-    )
-}
-
-fn section_summary(root: &Path, inventory: &Inventory, revision: &str) -> ContextSection {
     let mut refs = Vec::new();
     let mut body = String::new();
     let mut limitations = Vec::new();
@@ -528,36 +491,34 @@ fn section_summary(root: &Path, inventory: &Inventory, revision: &str) -> Contex
     let readme = ["README.md", "README.rst", "README.txt", "readme.md"]
         .into_iter()
         .find(|candidate| inventory.get(candidate).is_some());
-
     match readme {
         Some(path) => {
-            if let Some(entry) = inventory.get(path) {
-                refs.push(SourceRef::file(path, entry.content_hash.clone()));
-            }
-            let text = project::resolve_within_root(root, path)
-                .ok()
-                .and_then(|absolute| std::fs::read_to_string(absolute).ok())
-                .unwrap_or_default();
-            let excerpt: Vec<&str> = text
+            refs.extend(source(inventory, path));
+            let text = read_text(root, path);
+            // The first prose paragraph: skip headings, badges, HTML and fences.
+            let paragraph: Vec<&str> = text
                 .lines()
-                .filter(|line| !line.trim_start().starts_with('#') && !line.trim().is_empty())
-                .take(6)
+                .map(str::trim)
+                .skip_while(|line| {
+                    line.is_empty()
+                        || line.starts_with('#')
+                        || line.starts_with("[![")
+                        || line.starts_with('<')
+                        || line.starts_with("```")
+                })
+                .take_while(|line| !line.is_empty())
+                .take(4)
                 .collect();
-            body.push_str(&format!("_Extracted verbatim from `{path}`._\n\n"));
-            if excerpt.is_empty() {
-                body.push_str("_The README has no prose paragraphs to quote._\n");
+            if paragraph.is_empty() {
+                limitations.push(format!("`{path}` has no prose paragraph to quote."));
             } else {
-                for line in excerpt {
-                    body.push_str("> ");
-                    body.push_str(line.trim());
-                    body.push('\n');
+                for line in paragraph {
+                    body.push_str(&format!("> {line}\n"));
                 }
+                body.push('\n');
             }
         }
-        None => {
-            body.push_str("_No README was found, so no project description could be extracted._\n");
-            limitations.push("No README to summarise.".to_string());
-        }
+        None => limitations.push("No README was found, so there is no description.".to_string()),
     }
 
     let mut languages: BTreeMap<&str, usize> = BTreeMap::new();
@@ -568,242 +529,208 @@ fn section_summary(root: &Path, inventory: &Inventory, revision: &str) -> Contex
     }
     let mut ranked: Vec<_> = languages
         .into_iter()
-        .filter(|(lang, _)| *lang != "unknown")
+        .filter(|(language, _)| *language != "unknown")
         .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
-    body.push_str("\n**Language mix (by file count)**\n\n");
-    for (language, count) in ranked.iter().take(8) {
-        body.push_str(&format!("- {language}: {count}\n"));
+    if !ranked.is_empty() {
+        let mix: Vec<String> = ranked
+            .iter()
+            .take(6)
+            .map(|(language, count)| format!("{language} {count}"))
+            .collect();
+        body.push_str(&format!("- **Languages:** {}\n", mix.join(" · ")));
     }
+
+    let entry_points: Vec<&str> = ENTRY_POINTS
+        .iter()
+        .copied()
+        .filter(|path| inventory.get(path).is_some())
+        .collect();
+    body.push_str(&format!(
+        "- **Entry points:** {}\n",
+        if entry_points.is_empty() {
+            "none at the usual paths".to_string()
+        } else {
+            capped_list(&entry_points, LIST_CAP)
+        }
+    ));
+    refs.extend(
+        entry_points
+            .iter()
+            .filter_map(|path| source(inventory, path)),
+    );
+
+    let skipped: Vec<String> = inventory
+        .class_counts()
+        .into_iter()
+        .filter(|(label, _)| label != "text")
+        .map(|(label, count)| format!("{count} {label}"))
+        .collect();
+    body.push_str(&format!(
+        "- **Files:** {} used for context, of {} scanned{}\n",
+        inventory.selectable().count(),
+        inventory.stats.files_seen,
+        if skipped.is_empty() {
+            String::new()
+        } else {
+            format!(" (skipped: {})", skipped.join(", "))
+        }
+    ));
 
     limitations.push(
-        "This section quotes the README rather than describing the code. Narrative summaries require an approved model run.".to_string(),
+        "Entry points are matched by conventional file names, not read from the build configuration."
+            .to_string(),
     );
-    ContextSection::deterministic(
-        "summary",
-        "Project Summary",
-        body,
-        refs,
-        limitations,
-        revision,
-    )
-}
-
-fn section_directory_structure(inventory: &Inventory, revision: &str) -> ContextSection {
-    let mut directories: BTreeMap<String, (usize, u64)> = BTreeMap::new();
-    for entry in &inventory.files {
-        let directory = entry
-            .path
-            .rsplit_once('/')
-            .map(|(dir, _)| dir.to_string())
-            .unwrap_or_else(|| ".".to_string());
-        let slot = directories.entry(directory).or_insert((0, 0));
-        slot.0 += 1;
-        slot.1 += entry.size_bytes;
+    if inventory.stats.truncated {
+        limitations.push(
+            "The scan hit its file limit, so the project is only partly covered.".to_string(),
+        );
     }
-
-    let mut body = String::from("| Directory | Files | Size |\n| --- | ---: | ---: |\n");
-    for (directory, (count, bytes)) in directories.iter().take(200) {
-        body.push_str(&format!(
-            "| `{directory}` | {count} | {} |\n",
-            crate::walker::human_bytes(*bytes)
-        ));
+    if analysis.truncated {
+        limitations.push("Symbol analysis stopped at the configured file cap.".to_string());
     }
-    let limitations = if directories.len() > 200 {
-        vec![format!(
-            "{} directories exist; the table shows the first 200 in path order.",
-            directories.len()
-        )]
-    } else {
-        Vec::new()
-    };
-    ContextSection::deterministic(
-        "directory_structure",
-        "Directory Structure",
-        body,
-        Vec::new(),
-        limitations,
-        revision,
-    )
-}
-
-fn section_file_inventory(
-    inventory: &Inventory,
-    options: &GenerateOptions,
-    revision: &str,
-) -> ContextSection {
-    let mut body =
-        String::from("| Path | Class | Size | Content hash |\n| --- | --- | ---: | --- |\n");
-    let mut shown = 0;
-    for entry in &inventory.files {
-        if shown >= options.max_inventory_rows {
-            break;
-        }
-        body.push_str(&format!(
-            "| `{}` | {} | {} | `{}` |\n",
-            entry.path,
-            entry.class.label(),
-            crate::walker::human_bytes(entry.size_bytes),
-            entry
-                .content_hash
-                .as_deref()
-                .map(|hash| &hash[..12.min(hash.len())])
-                .unwrap_or("—")
-        ));
-        shown += 1;
-    }
-    let mut limitations = Vec::new();
-    if inventory.files.len() > shown {
+    if !analysis.unanalyzed.is_empty() {
         limitations.push(format!(
-            "{} of {} files are listed. The full inventory is available in the app.",
-            shown,
-            inventory.files.len()
+            "{} could not be read and are left out.",
+            plural(analysis.unanalyzed.len(), "file")
         ));
     }
-    if inventory
-        .files
-        .iter()
-        .any(|entry| entry.content_hash.is_none())
-    {
-        limitations.push("Files shown with `—` were not hashed (binary, oversized or unreadable); their freshness cannot be verified by content.".to_string());
+    ContextSection::deterministic("overview", "Overview", body, refs, limitations, revision)
+}
+
+/// One folder in the structure tree, counting files used for context.
+#[derive(Default)]
+struct Folder {
+    total: usize,
+    direct: usize,
+    children: BTreeMap<String, Folder>,
+}
+
+impl Folder {
+    /// Follows single-child chains (`crates/` → `crates/leanai-core/`) so a
+    /// folder that only wraps another is not shown on its own.
+    fn collapse(mut path: String, mut folder: &Folder) -> (String, &Folder) {
+        while folder.direct == 0 && folder.children.len() == 1 {
+            let Some((name, child)) = folder.children.iter().next() else {
+                break;
+            };
+            path = format!("{path}/{name}");
+            folder = child;
+        }
+        (path, folder)
     }
+
+    fn largest_first(&self) -> Vec<(String, &Folder)> {
+        let mut out: Vec<(String, &Folder)> = self
+            .children
+            .iter()
+            .map(|(name, folder)| Self::collapse(name.clone(), folder))
+            .collect();
+        out.sort_by(|a, b| b.1.total.cmp(&a.1.total).then(a.0.cmp(&b.0)));
+        out
+    }
+}
+
+/// Top-level folders and their main subfolders, with file counts.
+fn section_structure(inventory: &Inventory, revision: &str) -> ContextSection {
+    let mut tree = Folder::default();
+    for entry in inventory.selectable() {
+        let mut node = &mut tree;
+        node.total += 1;
+        let parts: Vec<&str> = entry.path.split('/').collect();
+        for dir in &parts[..parts.len() - 1] {
+            node = node.children.entry((*dir).to_string()).or_default();
+            node.total += 1;
+        }
+        node.direct += 1;
+    }
+
+    let mut body = String::new();
+    let top = tree.largest_first();
+    for (path, folder) in top.iter().take(25) {
+        body.push_str(&format!("- `{path}/` — {}\n", plural(folder.total, "file")));
+        let children = folder.largest_first();
+        if !children.is_empty() {
+            let shown: Vec<String> = children
+                .iter()
+                .take(8)
+                .map(|(name, child)| format!("`{name}/` {}", child.total))
+                .collect();
+            let more = if children.len() > 8 {
+                format!(" (+{} more)", children.len() - 8)
+            } else {
+                String::new()
+            };
+            body.push_str(&format!("  - {}{more}\n", shown.join(" · ")));
+        }
+    }
+    if top.len() > 25 {
+        body.push_str(&format!("- …and {} more folders\n", top.len() - 25));
+    }
+    if tree.direct > 0 {
+        body.push_str(&format!(
+            "- {} at the top level\n",
+            plural(tree.direct, "file")
+        ));
+    }
+    if body.is_empty() {
+        body.push_str("_No files are eligible for context._\n");
+    }
+
     ContextSection::deterministic(
-        "file_inventory",
-        "File Inventory",
+        "structure",
+        "Structure",
         body,
         Vec::new(),
-        limitations,
+        vec!["Counts only files used for context; binary, generated and excluded files are left out.".to_string()],
         revision,
     )
 }
 
-fn section_core_architecture(
-    inventory: &Inventory,
-    analysis: &Analysis,
-    revision: &str,
-) -> ContextSection {
-    // Cluster by top-level directory and count cross-cluster imports. This is
-    // a structural observation, not a design description.
-    let mut clusters: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for file in &analysis.files {
-        let cluster = file
-            .path
-            .split_once('/')
-            .map(|(head, _)| head.to_string())
-            .unwrap_or_else(|| "(root)".to_string());
-        let slot = clusters.entry(cluster).or_insert((0, 0));
-        slot.0 += 1;
-        slot.1 += file.symbols.len();
-    }
-
-    let mut body = String::from(
-        "Observed structure, derived from directory layout and declaration counts.\n\n| Area | Files analysed | Declarations |\n| --- | ---: | ---: |\n",
-    );
-    for (cluster, (files, declarations)) in &clusters {
-        body.push_str(&format!("| `{cluster}/` | {files} | {declarations} |\n"));
-    }
-
-    let mut edges: BTreeMap<(String, String), usize> = BTreeMap::new();
-    let cluster_names: BTreeSet<&String> = clusters.keys().collect();
-    for file in &analysis.files {
-        let from = file
-            .path
-            .split_once('/')
-            .map(|(head, _)| head.to_string())
-            .unwrap_or_else(|| "(root)".to_string());
-        for import in &file.imports {
-            let target = import.trim_start_matches("./").trim_start_matches("../");
-            let head = target
-                .split(['/', ':', '.'])
-                .next()
-                .unwrap_or("")
-                .to_string();
-            if head.is_empty() || head == from || !cluster_names.contains(&head) {
-                continue;
-            }
-            *edges.entry((from.clone(), head)).or_insert(0) += 1;
-        }
-    }
-    if !edges.is_empty() {
-        body.push_str("\n**Import edges between areas**\n\n");
-        let mut ranked: Vec<_> = edges.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        for ((from, to), count) in ranked.into_iter().take(25) {
-            body.push_str(&format!("- `{from}` → `{to}` ({count} imports)\n"));
-        }
-    }
-
-    let refs = analysis
-        .files
-        .iter()
-        .filter_map(|file| {
-            inventory
-                .get(&file.path)
-                .map(|entry| SourceRef::file(&file.path, entry.content_hash.clone()))
-        })
-        .take(50)
-        .collect();
-
-    ContextSection::deterministic(
-        "core_architecture",
-        "Core Architecture",
-        body,
-        refs,
-        vec![
-            "Derived from import statements and directory layout only. It describes how the code is arranged, not why.".to_string(),
-            "Dynamic imports, dependency injection and runtime wiring are invisible to this analysis.".to_string(),
-        ],
-        revision,
-    )
-}
-
+/// The files that export the most names, one line each.
 fn section_key_modules(
     inventory: &Inventory,
     analysis: &Analysis,
     revision: &str,
 ) -> ContextSection {
-    let mut ranked: Vec<&symbols::FileSymbols> = analysis
-        .files
-        .iter()
-        .filter(|file| !file.symbols.is_empty())
-        .collect();
-    ranked.sort_by(|a, b| {
-        b.symbols
+    let exported = |file: &symbols::FileSymbols| -> Vec<String> {
+        file.symbols
             .iter()
             .filter(|symbol| symbol.exported)
-            .count()
-            .cmp(&a.symbols.iter().filter(|symbol| symbol.exported).count())
-            .then(a.path.cmp(&b.path))
-    });
+            .map(|symbol| symbol.name.clone())
+            .collect()
+    };
+    let mut ranked: Vec<(&symbols::FileSymbols, Vec<String>)> = analysis
+        .files
+        .iter()
+        .filter(|file| !is_test_path(&file.path))
+        .map(|file| (file, exported(file)))
+        .filter(|(_, names)| !names.is_empty())
+        .collect();
+    ranked.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then(a.0.path.cmp(&b.0.path)));
 
     let mut body = String::new();
     let mut refs = Vec::new();
-    for file in ranked.iter().take(30) {
-        body.push_str(&format!("### `{}`\n\n", file.path));
-        for symbol in file
-            .symbols
-            .iter()
-            .filter(|symbol| symbol.exported)
-            .take(20)
-        {
-            body.push_str(&format!(
-                "- `{}` — {} (`{}:{}`)\n",
-                symbol.name,
-                kind_label(symbol.kind),
-                file.path,
-                symbol.line
-            ));
-        }
-        body.push('\n');
-        if let Some(entry) = inventory.get(&file.path) {
-            refs.push(SourceRef::file(&file.path, entry.content_hash.clone()));
-        }
+    for (file, names) in ranked.iter().take(MODULE_CAP) {
+        body.push_str(&format!(
+            "- `{}` — {}\n",
+            file.path,
+            capped_list(names, NAMES_PER_MODULE)
+        ));
+        refs.extend(source(inventory, &file.path));
+    }
+    if ranked.len() > MODULE_CAP {
+        body.push_str(&format!(
+            "- …and {} more files that export names\n",
+            ranked.len() - MODULE_CAP
+        ));
     }
     if body.is_empty() {
-        body.push_str("_No exported declarations were extracted._\n");
+        body.push_str("_No exported declarations were found._\n");
     }
 
     let mut limitations = vec![
+        "Ranked by how many names a file exports, which is not the same as importance. Test files are left out.".to_string(),
         "Declarations are found by line-oriented pattern matching, not by a parser. Macros, generated code and unusual formatting can be missed.".to_string(),
     ];
     let unsupported: BTreeSet<&str> = analysis
@@ -814,7 +741,7 @@ fn section_key_modules(
         .collect();
     if !unsupported.is_empty() {
         limitations.push(format!(
-            "No symbol extractor for: {}. Files in those languages appear at file level only.",
+            "No symbol extractor for: {}. Files in those languages are not listed here.",
             unsupported.into_iter().collect::<Vec<_>>().join(", ")
         ));
     }
@@ -835,27 +762,26 @@ fn section_api_contracts(
 ) -> ContextSection {
     let mut body = String::new();
     let mut refs = Vec::new();
-    if analysis.routes.is_empty() {
-        body.push_str("_No HTTP route declarations matched the supported framework patterns._\n");
-    } else {
-        body.push_str("| Method | Route | Declared in |\n| --- | --- | --- |\n");
-        for route in analysis.routes.iter().take(150) {
-            body.push_str(&format!(
-                "| {} | `{}` | `{}:{}` |\n",
-                route.method, route.route, route.path, route.line
-            ));
-        }
-        let paths: BTreeSet<&str> = analysis
-            .routes
-            .iter()
-            .map(|route| route.path.as_str())
-            .collect();
-        for path in paths {
-            if let Some(entry) = inventory.get(path) {
-                refs.push(SourceRef::file(path, entry.content_hash.clone()));
-            }
-        }
+    let routes: Vec<&RouteDeclaration> = analysis
+        .routes
+        .iter()
+        .filter(|route| !is_test_path(&route.path))
+        .collect();
+    for route in routes.iter().take(25) {
+        body.push_str(&format!(
+            "- `{} {}` — `{}:{}`\n",
+            route.method, route.route, route.path, route.line
+        ));
     }
+    if routes.len() > 25 {
+        body.push_str(&format!("- …and {} more routes\n", routes.len() - 25));
+    }
+    let route_files: BTreeSet<&str> = routes.iter().map(|route| route.path.as_str()).collect();
+    refs.extend(
+        route_files
+            .into_iter()
+            .filter_map(|path| source(inventory, path)),
+    );
 
     let schema_files: Vec<&str> = inventory
         .selectable()
@@ -870,28 +796,34 @@ fn section_api_contracts(
         })
         .collect();
     if !schema_files.is_empty() {
-        body.push_str("\n**Interface definition files**\n\n");
-        for path in &schema_files {
-            body.push_str(&format!("- `{path}`\n"));
-            if let Some(entry) = inventory.get(path) {
-                refs.push(SourceRef::file(path, entry.content_hash.clone()));
-            }
-        }
+        body.push_str(&format!(
+            "- **Interface files:** {}\n",
+            capped_list(&schema_files, LIST_CAP)
+        ));
+        refs.extend(
+            schema_files
+                .iter()
+                .filter_map(|path| source(inventory, path)),
+        );
+    }
+    if body.is_empty() {
+        body.push_str("_No HTTP routes or interface files found._\n");
     }
 
     ContextSection::deterministic(
         "api_contracts",
-        "API Contracts",
+        "API Routes",
         body,
         refs,
         vec![
-            "Route detection covers common Express/Fastify, Flask/FastAPI and axum/actix patterns only. Routes built dynamically are not listed.".to_string(),
+            "Route detection covers common Express/Fastify, Flask/FastAPI and axum/actix patterns only. Routes built dynamically, and routes in test files, are not listed.".to_string(),
             "Request and response shapes are not inferred. Open the linked file for the actual contract.".to_string(),
         ],
         revision,
     )
 }
 
+/// One line per dependency manifest.
 fn section_dependencies(root: &Path, inventory: &Inventory, revision: &str) -> ContextSection {
     let manifests = [
         "package.json",
@@ -907,7 +839,6 @@ fn section_dependencies(root: &Path, inventory: &Inventory, revision: &str) -> C
     ];
     let mut body = String::new();
     let mut refs = Vec::new();
-    let mut found = false;
 
     for name in manifests {
         for entry in inventory
@@ -915,30 +846,22 @@ fn section_dependencies(root: &Path, inventory: &Inventory, revision: &str) -> C
             .iter()
             .filter(|entry| entry.path == name || entry.path.ends_with(&format!("/{name}")))
         {
-            found = true;
             refs.push(SourceRef::file(&entry.path, entry.content_hash.clone()));
-            body.push_str(&format!("### `{}`\n\n", entry.path));
-            let text = project::resolve_within_root(root, &entry.path)
-                .ok()
-                .and_then(|absolute| std::fs::read_to_string(absolute).ok())
-                .unwrap_or_default();
-            let names = parse_dependency_names(name, &text);
+            let names = parse_dependency_names(name, &read_text(root, &entry.path));
             if names.is_empty() {
-                body.push_str("_No dependency entries were parsed from this manifest._\n\n");
+                body.push_str(&format!("- `{}`: no dependencies parsed\n", entry.path));
             } else {
-                body.push_str(&format!("{} declared dependencies:\n\n", names.len()));
-                for dependency in names.iter().take(80) {
-                    body.push_str(&format!("- `{dependency}`\n"));
-                }
-                if names.len() > 80 {
-                    body.push_str(&format!("- _…and {} more_\n", names.len() - 80));
-                }
-                body.push('\n');
+                body.push_str(&format!(
+                    "- `{}` ({}): {}\n",
+                    entry.path,
+                    names.len(),
+                    capped_list(&names, LIST_CAP)
+                ));
             }
         }
     }
-    if !found {
-        body.push_str("_No recognised dependency manifest was found._\n");
+    if body.is_empty() {
+        body.push_str("_No dependency manifest found._\n");
     }
 
     ContextSection::deterministic(
@@ -1032,11 +955,33 @@ fn parse_dependency_names(manifest: &str, text: &str) -> Vec<String> {
     names.into_iter().collect()
 }
 
+/// Declared scripts and automation: how to build, test and run the project.
 fn section_workflows(root: &Path, inventory: &Inventory, revision: &str) -> ContextSection {
     let mut body = String::new();
     let mut refs = Vec::new();
 
-    let ci_files: Vec<&str> = inventory
+    if let Some(entry) = inventory.get("package.json") {
+        let text = read_text(root, "package.json");
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(scripts) = value.get("scripts").and_then(|value| value.as_object()) {
+                for (name, command) in scripts.iter().take(LIST_CAP) {
+                    body.push_str(&format!(
+                        "- `npm run {name}` — `{}`\n",
+                        command.as_str().unwrap_or("").replace('`', "'")
+                    ));
+                }
+                if scripts.len() > LIST_CAP {
+                    body.push_str(&format!(
+                        "- …and {} more npm scripts\n",
+                        scripts.len() - LIST_CAP
+                    ));
+                }
+                refs.push(SourceRef::file("package.json", entry.content_hash.clone()));
+            }
+        }
+    }
+
+    let automation: Vec<&str> = inventory
         .files
         .iter()
         .map(|entry| entry.path.as_str())
@@ -1050,42 +995,20 @@ fn section_workflows(root: &Path, inventory: &Inventory, revision: &str) -> Cont
                 || *path == "Taskfile.yml"
         })
         .collect();
-
-    body.push_str("**Automation and task files**\n\n");
-    if ci_files.is_empty() {
-        body.push_str("_None found._\n");
-    } else {
-        for path in &ci_files {
-            body.push_str(&format!("- `{path}`\n"));
-            if let Some(entry) = inventory.get(path) {
-                refs.push(SourceRef::file(path, entry.content_hash.clone()));
-            }
-        }
+    if !automation.is_empty() {
+        body.push_str(&format!(
+            "- **Automation:** {}\n",
+            capped_list(&automation, LIST_CAP)
+        ));
+        refs.extend(automation.iter().filter_map(|path| source(inventory, path)));
     }
-
-    if let Some(entry) = inventory.get("package.json") {
-        let text = project::resolve_within_root(root, "package.json")
-            .ok()
-            .and_then(|absolute| std::fs::read_to_string(absolute).ok())
-            .unwrap_or_default();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(scripts) = value.get("scripts").and_then(|value| value.as_object()) {
-                body.push_str("\n**npm scripts**\n\n| Script | Command |\n| --- | --- |\n");
-                for (name, command) in scripts {
-                    body.push_str(&format!(
-                        "| `{}` | `{}` |\n",
-                        name,
-                        command.as_str().unwrap_or("").replace('|', "\\|")
-                    ));
-                }
-                refs.push(SourceRef::file("package.json", entry.content_hash.clone()));
-            }
-        }
+    if body.is_empty() {
+        body.push_str("_No scripts or automation files found._\n");
     }
 
     ContextSection::deterministic(
         "workflows",
-        "Workflows",
+        "How to Run",
         body,
         refs,
         vec!["Lists declared automation only. Whether these workflows currently pass is not checked here.".to_string()],
@@ -1098,7 +1021,7 @@ fn section_configuration(
     analysis: &Analysis,
     revision: &str,
 ) -> ContextSection {
-    let mut body = String::from("**Configuration files**\n\n");
+    let mut body = String::new();
     let mut refs = Vec::new();
     let config_files: Vec<&str> = inventory
         .files
@@ -1110,37 +1033,34 @@ fn section_configuration(
                 || name.ends_with(".config.ts")
                 || name.ends_with(".config.mjs")
                 || name.starts_with("tsconfig")
-                || name == "vite.config.ts"
                 || name == "dockerfile"
                 || name.starts_with("docker-compose")
                 || name == ".editorconfig"
                 || name == "tauri.conf.json"
                 || name.ends_with(".env.example")
         })
-        .take(100)
         .collect();
-    if config_files.is_empty() {
-        body.push_str("_None found._\n");
-    } else {
-        for path in &config_files {
-            body.push_str(&format!("- `{path}`\n"));
-            if let Some(entry) = inventory.get(path) {
-                refs.push(SourceRef::file(path, entry.content_hash.clone()));
-            }
-        }
+    if !config_files.is_empty() {
+        body.push_str(&format!(
+            "- **Config files:** {}\n",
+            capped_list(&config_files, LIST_CAP)
+        ));
+        refs.extend(
+            config_files
+                .iter()
+                .filter_map(|path| source(inventory, path)),
+        );
     }
-
-    body.push_str("\n**Environment variables referenced in code**\n\n");
-    if analysis.env_vars.is_empty() {
-        body.push_str("_None detected._\n");
-    } else {
-        for name in analysis.env_vars.iter().take(120) {
-            body.push_str(&format!("- `{name}`\n"));
-        }
+    if !analysis.env_vars.is_empty() {
+        let names: Vec<&str> = analysis.env_vars.iter().map(String::as_str).collect();
+        body.push_str(&format!(
+            "- **Environment variables:** {}\n\n_Variable names only; LeanAI never reads or records their values._\n",
+            capped_list(&names, 20)
+        ));
     }
-    body.push_str(
-        "\n> Variable **names** are listed. LeanAI never reads or records their values.\n",
-    );
+    if body.is_empty() {
+        body.push_str("_No configuration files or environment variables found._\n");
+    }
 
     ContextSection::deterministic(
         "configuration",
@@ -1155,44 +1075,53 @@ fn section_configuration(
 fn section_known_issues(
     inventory: &Inventory,
     analysis: &Analysis,
+    options: &GenerateOptions,
     revision: &str,
 ) -> ContextSection {
     let mut body = String::new();
-    let mut refs = Vec::new();
-    if analysis.todos.is_empty() {
-        body.push_str("_No TODO, FIXME, HACK, XXX or BUG markers were found._\n");
-    } else {
-        body.push_str("| Location | Note |\n| --- | --- |\n");
-        for (path, line, note) in &analysis.todos {
-            body.push_str(&format!(
-                "| `{}:{}` | {} |\n",
-                path,
-                line,
-                note.replace('|', "\\|")
-            ));
-        }
-        let paths: BTreeSet<&str> = analysis
-            .todos
-            .iter()
-            .map(|(path, _, _)| path.as_str())
-            .collect();
-        for path in paths.into_iter().take(80) {
-            if let Some(entry) = inventory.get(path) {
-                refs.push(SourceRef::file(path, entry.content_hash.clone()));
-            }
-        }
+    for (path, line, note) in analysis.todos.iter().take(LIST_CAP) {
+        body.push_str(&format!("- `{path}:{line}` — {note}\n"));
     }
+    if analysis.todos.len() > LIST_CAP {
+        body.push_str(&format!(
+            "- …and {} more{}\n",
+            analysis.todos.len() - LIST_CAP,
+            if analysis.todos.len() >= options.max_todos {
+                " (counting stopped at the limit)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if body.is_empty() {
+        body.push_str("_No TODO, FIXME, HACK, XXX or BUG markers found._\n");
+    }
+    let paths: BTreeSet<&str> = analysis
+        .todos
+        .iter()
+        .map(|(path, _, _)| path.as_str())
+        .collect();
+    let refs = paths
+        .into_iter()
+        .take(80)
+        .filter_map(|path| source(inventory, path))
+        .collect();
     ContextSection::deterministic(
         "known_issues",
-        "Known Issues and TODOs",
+        "Open TODOs",
         body,
         refs,
-        vec!["Source-code markers only. An issue tracker is not consulted.".to_string()],
+        vec!["Only markers at the start of a comment are counted. An issue tracker is not consulted.".to_string()],
         revision,
     )
 }
 
-fn section_notes_and_decisions(inventory: &Inventory, revision: &str) -> ContextSection {
+/// Decision records, each with its own title.
+fn section_notes_and_decisions(
+    root: &Path,
+    inventory: &Inventory,
+    revision: &str,
+) -> ContextSection {
     let mut body = String::new();
     let mut refs = Vec::new();
     let decision_files: Vec<&str> = inventory
@@ -1200,119 +1129,68 @@ fn section_notes_and_decisions(inventory: &Inventory, revision: &str) -> Context
         .map(|entry| entry.path.as_str())
         .filter(|path| {
             let lower = path.to_ascii_lowercase();
-            lower.contains("/adr/") || lower.contains("decision") || lower.contains("/rfc")
+            (lower.contains("/adr/") || lower.contains("decision") || lower.contains("/rfc"))
+                && !lower.contains("template")
         })
-        .take(100)
         .collect();
-    if decision_files.is_empty() {
-        body.push_str("_No architecture decision records were found._\n");
-    } else {
-        for path in &decision_files {
-            body.push_str(&format!("- `{path}`\n"));
-            if let Some(entry) = inventory.get(path) {
-                refs.push(SourceRef::file(path, entry.content_hash.clone()));
-            }
+    for path in decision_files.iter().take(20) {
+        let text = read_text(root, path);
+        let title = text
+            .lines()
+            .find_map(|line| line.strip_prefix("# "))
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+        match title {
+            Some(title) => body.push_str(&format!("- `{path}` — {title}\n")),
+            None => body.push_str(&format!("- `{path}`\n")),
         }
+        refs.extend(source(inventory, path));
+    }
+    if decision_files.len() > 20 {
+        body.push_str(&format!(
+            "- …and {} more decision files\n",
+            decision_files.len() - 20
+        ));
+    }
+    if body.is_empty() {
+        body.push_str("_No architecture decision records found._\n");
     }
     ContextSection::deterministic(
         "notes_and_decisions",
-        "Notes and Decisions",
+        "Decisions",
         body,
         refs,
-        vec!["Files are listed by path convention; their contents are not summarised.".to_string()],
+        vec!["Found by path convention; only each file's title is shown.".to_string()],
         revision,
     )
 }
 
-fn section_agent_task_history(revision: &str) -> ContextSection {
-    ContextSection::deterministic(
-        "agent_task_history",
-        "Agent Task History",
-        "_No agent runs have been recorded for this project._\n\nCompleted runs append a concise, source-cited finding here. Full transcripts are not stored by default.\n".to_string(),
-        Vec::new(),
-        Vec::new(),
-        revision,
-    )
-}
-
-fn section_source_references(
-    inventory: &Inventory,
-    analysis: &Analysis,
-    revision: &str,
-) -> ContextSection {
-    let mut body = String::from(
-        "Every section above records the files it was generated from, together with the content hash at generation time. When a hash no longer matches, the section is marked **stale** and the claim must be re-verified against the current source.\n\n",
-    );
-    body.push_str(&format!(
-        "- Files hashed at generation: {}\n",
-        inventory
-            .files
-            .iter()
-            .filter(|entry| entry.content_hash.is_some())
-            .count()
-    ));
-    body.push_str(&format!(
-        "- Files without a content hash (freshness unverifiable): {}\n",
-        inventory
-            .files
-            .iter()
-            .filter(|entry| entry.content_hash.is_none())
-            .count()
-    ));
-    if !analysis.unanalyzed.is_empty() {
-        body.push_str(&format!(
-            "- Files that could not be read during analysis: {}\n",
-            analysis.unanalyzed.len()
-        ));
-    }
-    body.push_str("\n**Source-on-demand**\n\nAsk LeanAI for `<path>` at the recorded revision to retrieve the exact bytes a claim was based on, rather than trusting the summary.\n");
-
-    ContextSection::deterministic(
-        "source_references",
-        "Source References and Change Impact",
-        body,
-        Vec::new(),
-        Vec::new(),
-        revision,
-    )
-}
-
-fn kind_label(kind: SymbolKind) -> &'static str {
-    match kind {
-        SymbolKind::Function => "function",
-        SymbolKind::Class => "class",
-        SymbolKind::Struct => "struct",
-        SymbolKind::Enum => "enum",
-        SymbolKind::Interface => "interface",
-        SymbolKind::Trait => "trait",
-        SymbolKind::Type => "type",
-        SymbolKind::Constant => "constant",
-        SymbolKind::Module => "module",
-        SymbolKind::Route => "route",
-    }
-}
-
-/// Renders the document to `PROJECT_CONTEXT.md`.
+/// Renders the document to `PROJECT_CONTEXT.md`: a title, one revision line,
+/// the sections, and a closing note. Provenance stays in the stored document.
 pub fn render(document: &ContextDocument) -> String {
     let mut out = String::new();
-    out.push_str("# Project Context\n\n");
+    if document.project_name.is_empty() {
+        out.push_str("# Project Context\n\n");
+    } else {
+        out.push_str(&format!("# Project Context: {}\n\n", document.project_name));
+    }
     out.push_str(&format!(
-        "<!-- leanai.context/v{} revision={} -->\n\n",
+        "{FILE_MARKER}{} revision={} -->\n\n",
         document.schema_version, document.source_revision
     ));
-    out.push_str("> Generated by LeanAI Desktop. This is an index over the source with provenance, **not** a replacement for reading the code.\n\n");
+    out.push_str(&format!(
+        "Revision {} · built by LeanAI from the files themselves, not by a model.\n\n",
+        describe_revision(&document.source_revision)
+    ));
 
     for (key, title) in SECTION_KEYS {
         let Some(section) = document.section(key) else {
             continue;
         };
         out.push_str(&format!("## {title}\n\n"));
-        out.push_str(&format!(
-            "`{}` · generated at revision `{}` · source refs: {}\n\n",
-            freshness_badge(section.freshness),
-            section.generated_revision,
-            section.source_refs.len()
-        ));
+        if section.freshness == Freshness::Stale {
+            out.push_str("> **Stale:** files this section was built from have changed. Refresh the map in LeanAI before relying on it.\n\n");
+        }
         if let Generator::Model {
             provider,
             model,
@@ -1325,38 +1203,82 @@ pub fn render(document: &ContextDocument) -> String {
         }
         out.push_str(section.body.trim_end());
         out.push_str("\n\n");
-        if !section.limitations.is_empty() {
-            out.push_str("**Limitations**\n\n");
-            for limitation in &section.limitations {
-                out.push_str(&format!("- {limitation}\n"));
-            }
-            out.push('\n');
-        }
-        if !section.source_refs.is_empty() {
-            out.push_str("<details><summary>Sources</summary>\n\n");
-            for source in &section.source_refs {
-                out.push_str(&format!(
-                    "- `{}` @ `{}`\n",
-                    source.path,
-                    source
-                        .content_hash
-                        .as_deref()
-                        .map(|hash| &hash[..12.min(hash.len())])
-                        .unwrap_or("unhashed")
-                ));
-            }
-            out.push_str("\n</details>\n\n");
-        }
     }
+    out.push_str("---\n\n_This file is an index, not a replacement for reading the code. Symbols are found by pattern matching, not a full parse. Each section's sources, freshness and limits are shown in LeanAI under Context._\n");
     out
 }
 
-fn freshness_badge(freshness: Freshness) -> &'static str {
-    match freshness {
-        Freshness::Fresh => "fresh",
-        Freshness::Stale => "STALE — re-verify against source",
-        Freshness::Unknown => "unknown freshness",
+/// `git:<sha>[+dirty]` as a short commit plus a plain note; anything else
+/// (a content-hash revision) shortened.
+fn describe_revision(revision: &str) -> String {
+    match revision.strip_prefix("git:") {
+        Some(rest) => {
+            let (sha, dirty) = match rest.strip_suffix("+dirty") {
+                Some(sha) => (sha, true),
+                None => (rest, false),
+            };
+            format!(
+                "`{}`{}",
+                &sha[..7.min(sha.len())],
+                if dirty { " + uncommitted changes" } else { "" }
+            )
+        }
+        None => format!("`{}`", &revision[..20.min(revision.len())]),
     }
+}
+
+/// Renders only the requested sections, without provenance lists, within a
+/// token ceiling. This is what a model receives as initial project context:
+/// the full document is an index to draw from, never something sent whole.
+///
+/// Returns the rendered text and its local token estimate. Sections past the
+/// ceiling are cut at a line boundary and marked, so the model knows to ask
+/// for sources instead of assuming the index is complete.
+pub fn render_sections(
+    document: &ContextDocument,
+    keys: &[String],
+    max_tokens: usize,
+) -> (String, usize) {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for key in keys {
+        let Some(section) = document.section(key) else {
+            continue;
+        };
+        let stale = if section.freshness == Freshness::Stale {
+            " (stale: verify against source)"
+        } else {
+            ""
+        };
+        let heading = format!("## {}{stale}\n\n", section.title);
+        let heading_tokens = crate::tokenizer::estimate(&heading).value;
+        if used + heading_tokens >= max_tokens {
+            break;
+        }
+        out.push_str(&heading);
+        used += heading_tokens;
+
+        let mut truncated = false;
+        for line in section.body.trim_end().lines() {
+            let line_tokens = crate::tokenizer::estimate(line).value + 1;
+            if used + line_tokens > max_tokens {
+                truncated = true;
+                break;
+            }
+            out.push_str(line);
+            out.push('\n');
+            used += line_tokens;
+        }
+        if truncated {
+            out.push_str(
+                "… (truncated to fit the context budget; search or read files for detail)\n",
+            );
+            break;
+        }
+        out.push('\n');
+    }
+    let total = crate::tokenizer::estimate(&out).value;
+    (out, total)
 }
 
 /// Validates a model-written section before it is accepted (backlog 5.6).

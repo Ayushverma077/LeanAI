@@ -11,16 +11,19 @@
 
 pub mod agent;
 pub mod aiignore;
+pub mod apply_gate;
 pub mod approval;
 pub mod benchmark;
 pub mod catalog;
 pub mod classify;
 pub mod concat;
 pub mod context;
+pub mod context_file;
 pub mod error;
 pub mod gguf;
 pub mod gitinfo;
 pub mod inventory;
+pub mod llm_protocol;
 pub mod manifest;
 pub mod policy;
 pub mod project;

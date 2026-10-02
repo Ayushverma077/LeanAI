@@ -29,6 +29,11 @@ pub struct BundleOptions {
     pub normalize_line_endings: bool,
     /// Truncate any single file to this many bytes. `None` means no truncation.
     pub max_file_bytes: Option<u64>,
+    /// Put the project map (`PROJECT_CONTEXT.md`) above the files, so a model
+    /// sees the whole project's layout before the chosen code. The caller
+    /// supplies the map text to [`build_with_map`].
+    #[serde(default)]
+    pub include_project_map: bool,
 }
 
 impl Default for BundleOptions {
@@ -42,6 +47,7 @@ impl Default for BundleOptions {
             include_front_matter: false,
             normalize_line_endings: true,
             max_file_bytes: None,
+            include_project_map: false,
         }
     }
 }
@@ -68,6 +74,11 @@ pub struct Bundle {
     pub skipped: Vec<String>,
     pub byte_len: u64,
     pub file_count: usize,
+    /// Tokens used by the project map; 0 when it is not included.
+    pub project_map_tokens: usize,
+    /// Byte range of the project map block in `text`, when included. Lets a
+    /// preview show the map separately without re-deriving where it sits.
+    pub project_map_range: Option<(usize, usize)>,
 }
 
 /// Builds the bundle text from a resolved selection.
@@ -157,7 +168,43 @@ pub fn build(
     selection: &ResolvedSelection,
     options: &BundleOptions,
 ) -> Result<Bundle> {
+    build_with_map(root, inventory, selection, options, None)
+}
+
+/// Separates the project map from the files that follow it.
+const MAP_SEPARATOR: &str = "\n---\n\n";
+
+/// Like [`build`], with the rendered `PROJECT_CONTEXT.md` as `project_map`.
+///
+/// The map is included only when `options.include_project_map` is set and a
+/// map is given. It goes after any front matter and before the file tree, is
+/// part of the hashed text and counts toward the estimate, so a bundle with
+/// the map is as deterministic as one without it.
+pub fn build_with_map(
+    root: &Path,
+    inventory: &Inventory,
+    selection: &ResolvedSelection,
+    options: &BundleOptions,
+    project_map: Option<&str>,
+) -> Result<Bundle> {
     let root = project::canonical_root(root)?;
+
+    let map_block = match project_map {
+        Some(map) if options.include_project_map && !map.trim().is_empty() => {
+            let mut block = normalize_newlines(map.trim_end());
+            block.push('\n');
+            if !selection.files.is_empty() {
+                block.push_str(MAP_SEPARATOR);
+            }
+            block
+        }
+        _ => String::new(),
+    };
+    let map_tokens = if map_block.is_empty() {
+        0
+    } else {
+        tokenizer::estimate(&map_block).value
+    };
 
     let mut preamble = String::new();
     if options.include_tree && !selection.files.is_empty() {
@@ -206,12 +253,14 @@ pub fn build(
         })
     };
 
-    let mut text = String::with_capacity(selection.total_bytes as usize + 1024);
+    let mut text = String::with_capacity(selection.total_bytes as usize + map_block.len() + 1024);
+    text.push_str(&map_block);
     text.push_str(&preamble);
     let mut parts: Vec<(String, u64, usize)> = Vec::with_capacity(paths.len());
     let mut truncations = Vec::new();
     let mut skipped = Vec::new();
-    let mut total_tokens = preamble_tokens;
+    let mut total_tokens = map_tokens + preamble_tokens;
+    let mut map_start = 0usize;
 
     for (index, slot) in rendered.into_iter().enumerate() {
         match slot {
@@ -242,6 +291,7 @@ pub fn build(
         );
         let front_matter = format!("{}\n", manifest.to_front_matter());
         total_tokens += tokenizer::estimate(&front_matter).value;
+        map_start = front_matter.len();
         text = format!("{front_matter}{text}");
     }
 
@@ -268,6 +318,9 @@ pub fn build(
         truncations,
         skipped,
         byte_len,
+        project_map_tokens: map_tokens,
+        project_map_range: (!map_block.is_empty())
+            .then(|| (map_start, map_start + map_block.len())),
     })
 }
 

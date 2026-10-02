@@ -80,7 +80,7 @@ pub async fn start_task_run(
         privacy: PrivacySetting::LocalOnly,
         provider_model_id: request
             .provider_model_id
-            .unwrap_or_else(|| "claude-3-5-sonnet".to_string()),
+            .unwrap_or_else(|| "anthropic/claude-sonnet-5".to_string()),
         context_files: request.context_files.clone(),
         budget: budget.clone(),
     };
@@ -248,7 +248,6 @@ pub async fn start_task_run(
             patch_proposal.sha256_hash.clone(),
             300_000, // 5 minutes TTL
         );
-        state.with_db(|conn| save_approval(conn, &req))?;
         Some(req)
     } else {
         None
@@ -286,6 +285,10 @@ pub async fn start_task_run(
                 "agent_step",
                 &serde_json::to_value(step).unwrap_or(serde_json::Value::Null),
             )?;
+        }
+        // The approval references the run, so it is saved after the run row.
+        if let Some(req) = &approval {
+            save_approval(conn, req)?;
         }
         Ok(())
     })?;
@@ -326,6 +329,8 @@ pub struct ResolveApprovalResponse {
     pub patch_applied: bool,
     pub rollback_performed: bool,
     pub message: String,
+    /// True when PROJECT_CONTEXT.md was regenerated after files changed.
+    pub context_refreshed: bool,
 }
 
 #[tauri::command]
@@ -345,6 +350,12 @@ pub async fn resolve_approval(
             .ok_or_else(|| AppError::new("approval_not_found", "Approval request not found."))
     })?;
 
+    if std::path::Path::new(&approval.project_root) != root_path {
+        return Err(AppError::new(
+            "approval_project_mismatch",
+            "Reopen the project this change belongs to before reviewing it.",
+        ));
+    }
     if !approval.is_active() {
         return Err(AppError::new(
             "approval_expired",
@@ -357,6 +368,12 @@ pub async fn resolve_approval(
     } else {
         "denied"
     };
+
+    if request.approved {
+        if let Some(proposal) = &request.proposal {
+            verify_proposal_matches_approval(proposal, &approval)?;
+        }
+    }
 
     let (patch_applied, rollback_performed, message) = if request.approved {
         if let Some(proposal) = &request.proposal {
@@ -443,13 +460,50 @@ pub async fn resolve_approval(
         Ok(())
     })?;
 
+    // Files changed: refresh the project index so later prompts see them.
+    let context_refreshed = patch_applied
+        && crate::commands::context::refresh_project_context(&state)
+            .await
+            .is_ok();
+
     Ok(ResolveApprovalResponse {
         approval_id: request.approval_id,
         decision: decision_str.to_string(),
         patch_applied,
         rollback_performed,
         message,
+        context_refreshed,
     })
+}
+
+/// The approval covers one specific set of diffs. A proposal whose content
+/// hash or file set differs from what was approved is refused, so an approval
+/// can never be replayed against different changes.
+fn verify_proposal_matches_approval(
+    proposal: &PatchProposal,
+    approval: &ApprovalRequest,
+) -> AppResult<()> {
+    let content_bound = approval.patch_hash.len() == 64;
+    let hash_ok = if content_bound {
+        leanai_core::llm_protocol::proposal_hash(proposal) == approval.patch_hash
+    } else {
+        // Legacy guided runs identify proposals by an opaque id.
+        proposal.sha256_hash == approval.patch_hash
+    };
+    let paths_ok = proposal
+        .affected_files
+        .iter()
+        .chain(proposal.patches.iter().map(|p| &p.path))
+        .all(|path| approval.affected_paths.contains(path));
+    if hash_ok && paths_ok {
+        Ok(())
+    } else {
+        Err(AppError::new(
+            "approval_mismatch",
+            "These changes differ from the ones that were approved. Nothing was written.",
+        )
+        .with_recovery("Run the request again and review the new changes."))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

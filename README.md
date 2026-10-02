@@ -1,7 +1,8 @@
 # LeanAI Desktop
 
 Turn a local repository into a **deterministic, inspectable context bundle** —
-offline, with no API key, no account and no network access.
+offline, with no API key, no account and no network access — and, when you
+want, run a request against a model that receives only the context it asks for.
 
 You pick a directory. LeanAI walks it, shows what it excluded and why, lets you
 choose files, and produces one text bundle with a token estimate that is
@@ -14,8 +15,13 @@ never has to be taken on trust.
 - **Deterministic before generative.** Discovery, filtering, bundling, token
   estimation and the context index need no model. Same revision + same selection
   + same options ⇒ byte-identical output and the same SHA-256.
-- **The app has no network capability at all.** Not "disabled by default" —
-  the Tauri capability manifest does not grant it. Neither is shell access.
+- **The webview has no network or shell capability at all.** Not "disabled by
+  default": the Tauri capability manifest does not grant it. The Rust backend
+  goes online only for model providers you configure and GitHub operations you
+  start; scanning, bundling and the context index never do.
+- **A model's change is reviewed in proportion to its risk.** Small, clean
+  edits can apply automatically; anything touching build, CI, dependency or
+  permission files waits for a careful review (ADR 0013).
 - **Secrets are a policy, not a filter.** `.env`, keys and credential stores are
   unselectable by classification, so a folder-level "select all" cannot reach
   them. Including one takes a per-file confirmation you have to type.
@@ -55,15 +61,17 @@ cannot be widened by adding a command. See [docs/architecture.md](docs/architect
 
 ## Status
 
-Implemented and tested: Phases 0–5 of the plan, plus the parts of 11–12 that do
-not need signing credentials. Local models, cloud providers and agents (Phases
-6–10) are designed in ADRs 0007–0010 and are **not implemented**.
+Implemented and tested: Phases 0–10 of the plan, the Ask LeanAI prompt runner,
+and the parts of 11–12 that do not need signing credentials. Code signing and
+release publication need credentials this repository does not hold.
 
 The honest, itemised version is in
-[docs/project-status.md](docs/project-status.md).
+[docs/project-status.md](docs/project-status.md); what changed and when is in
+[docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 ## Documentation
 
+- [Changelog (dated history of every change)](docs/CHANGELOG.md)
 - [User guide](docs/user-guide.md)
 - [Architecture](docs/architecture.md)
 - [Threat model and prompt-injection policy](docs/security-threat-model.md)

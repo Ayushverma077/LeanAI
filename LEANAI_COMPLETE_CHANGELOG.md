@@ -2,6 +2,8 @@
 
 This document chronicles the complete development history and feature set built into LeanAI Desktop from the very beginning up to the current state.
 
+> For the dated, timestamped history of every change (what, why, files, verification), see [`docs/CHANGELOG.md`](docs/CHANGELOG.md). This file is a feature overview.
+
 ## 1. Core Architecture & Foundations
 * **Stack Initialization**: Set up a hybrid native/web application using **Tauri 2.11.5** (Rust backend) and **React + Vite** (Frontend).
 * **State Management**: Implemented a centralized, reactive store using **Zustand** (`useAppStore.ts`) to manage projects, bundle configurations, file selections, and git tracking.
@@ -43,3 +45,9 @@ This document chronicles the complete development history and feature set built 
   * Cleaned up the `TopBar`, `Sidebar`, and `StatusBar` by removing unnecessary technical noise, verbose labels, and heavy borders.
   * Overhauled the `OverviewPage` to remove heavy marketing banners in favor of a sleek, two-column layout focusing purely on metrics and file classification.
   * Shortened descriptive text and simplified panel structures across the `AgentsPage`, `SettingsPage`, `HistoryPage`, and `PreviewPage` to achieve a highly professional, modern aesthetic.
+
+## 7. Ask LeanAI and Risk-Scaled Review
+* **One-Box Prompt Runner**: The Tasks page's *Ask* mode routes a request locally, picks the cheapest capable model (local, cloud or self-hosted), sends only the `PROJECT_CONTEXT` sections the budget allows, and lets the model request files and searches through a validated JSON action protocol.
+* **Self-Hosted Models**: Any OpenAI-compatible server (Ollama, vLLM, LM Studio, llama.cpp) can be added by URL on the Models page; the router prefers it when it is strong enough because it costs nothing per token.
+* **Apply Gate (ADR 0013)**: Validated changes are ranked *apply automatically*, *review* or *review carefully*, with reasons. Build, CI, dependency, migration and permission files always get a careful review.
+* **Schema-Constrained Replies (ADR 0013)**: Agent turns ask the provider to constrain the reply to the action schema, so replies cannot come back malformed; servers without schema support fall back visibly.

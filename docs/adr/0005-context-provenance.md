@@ -1,6 +1,8 @@
 # ADR 0005: The context index is a cache with provenance, never the source of truth
 
-- **Status:** Accepted
+- **Status:** Accepted. How provenance is rendered is amended by
+  [ADR 0014](0014-short-project-context-file.md): it is kept in the stored
+  document and shown in the app, not printed into `PROJECT_CONTEXT.md`.
 - **Date:** 2026-09-06
 - **Relates to:** FR-17, FR-18, FR-19, FR-20, Instructions.md §2
 

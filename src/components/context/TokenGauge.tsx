@@ -90,9 +90,7 @@ export function TokenGauge({
               {tokens > 0 ? `~$${estimatedCost < 0.01 ? "<0.01" : estimatedCost.toFixed(2)}` : "—"}
             </span>
           </div>
-          <p className="text-[10px] text-ink-500">
-            input only · ${inputPricePer1M}/1M assumed
-          </p>
+          <p className="text-[10px] text-ink-500">input only · ${inputPricePer1M}/1M assumed</p>
         </div>
       </div>
 
@@ -125,8 +123,8 @@ export function TokenGauge({
       <div className="mt-3 rounded border border-ink-800/80 bg-ink-950/70 p-2 text-[10px] leading-relaxed text-ink-500">
         <span className="text-ink-400 font-medium">Notice: </span>
         Token counts come from the cl100k BPE tokenizer, which is an OpenAI-family count. Other
-        providers tokenise differently and bill by their own count, so treat both the tokens and
-        the cost as indicative, never as a quote.
+        providers tokenise differently and bill by their own count, so treat both the tokens and the
+        cost as indicative, never as a quote.
       </div>
     </div>
   );

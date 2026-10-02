@@ -4,7 +4,6 @@ import { api } from "../../ipc/client";
 import type { SidecarStatus } from "../../ipc/types";
 import { useAppStore, type Route } from "../../store/useAppStore";
 import {
-  AgentsIcon,
   ContextIcon,
   HistoryIcon,
   ModelsIcon,
@@ -47,11 +46,6 @@ export function Sidebar() {
       icon: ContextIcon,
       badge: selection.files.size > 0 ? selection.files.size : undefined,
       needsProject: true,
-    },
-    {
-      route: "agents",
-      label: "Agents",
-      icon: AgentsIcon,
     },
     {
       route: "tasks",
@@ -110,7 +104,9 @@ export function Sidebar() {
         )}
         <Icon
           size={14}
-          className={active ? "text-brand" : "text-ink-500 group-hover:text-ink-300 transition-colors"}
+          className={
+            active ? "text-brand" : "text-ink-500 group-hover:text-ink-300 transition-colors"
+          }
         />
         <span>{item.label}</span>
         {item.badge !== undefined && (
@@ -163,7 +159,9 @@ export function Sidebar() {
             }`}
           />
           <span className="mono text-[10px]">
-            {sidecarStatus.state === "ready" ? `sidecar :${sidecarStatus.port}` : sidecarStatus.state}
+            {sidecarStatus.state === "ready"
+              ? `sidecar :${sidecarStatus.port}`
+              : sidecarStatus.state}
           </span>
         </button>
       </div>

@@ -3,7 +3,6 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 import { useAppStore } from "../../store/useAppStore";
 import {
-  AgentsIcon,
   ContextIcon,
   HistoryIcon,
   ModelsIcon,
@@ -55,14 +54,6 @@ export function CommandPalette({ isOpen, onClose }: { isOpen: boolean; onClose: 
         shortcut: "G C",
         icon: ContextIcon,
         action: () => setRoute("context"),
-      },
-      {
-        id: "nav-agents",
-        title: "Go to Agent Fleet & Orchestration",
-        category: "Navigation",
-        shortcut: "G A",
-        icon: AgentsIcon,
-        action: () => setRoute("agents"),
       },
       {
         id: "nav-tasks",

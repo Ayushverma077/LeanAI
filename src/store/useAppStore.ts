@@ -26,7 +26,6 @@ import type {
 export type Route =
   | "overview"
   | "context"
-  | "agents"
   | "tasks"
   | "history"
   | "models"
@@ -71,6 +70,8 @@ interface AppStore {
   inventory: Inventory | null;
   classCounts: Record<string, number>;
   scanning: boolean;
+  /** True while the project map is being built after a project opens. */
+  preparingMap: boolean;
   scanProgress: ScanProgress | null;
   selection: SelectionState;
   options: BundleOptions;
@@ -90,7 +91,8 @@ interface AppStore {
   bootstrap: () => Promise<void>;
   openProject: (path: string) => Promise<void>;
   closeProject: () => Promise<void>;
-  scan: () => Promise<void>;
+  /** `stayOnPage`: do not switch pages when the scan finishes (project open). */
+  scan: (options?: { stayOnPage?: boolean }) => Promise<void>;
   cancelScan: () => Promise<void>;
   loadRemoteStatus: () => Promise<void>;
   loadGitAuth: () => Promise<void>;
@@ -109,7 +111,18 @@ interface AppStore {
   buildBundle: () => Promise<void>;
 
   loadContext: () => Promise<void>;
-  generateContext: () => Promise<void>;
+  /**
+   * Generates the project map. Pass `true` only after the user chose to
+   * replace an existing PROJECT_CONTEXT.md. Resolves to null on failure.
+   */
+  generateContext: (replaceExisting?: boolean) => Promise<ContextResponse | null>;
+  /**
+   * After a project opens: reuse its map if fresh, otherwise build it, then go
+   * to Tasks. Moves only if the user is still on `startedOn`.
+   */
+  prepareMapAndContinue: (startedOn: Route) => Promise<void>;
+  /** Regenerate on request, then go to Tasks (unless the file needs a decision). */
+  regenerateMap: (replaceExisting?: boolean) => Promise<void>;
 
   saveSettings: (settings: Settings) => Promise<void>;
   setTheme: (theme: Theme) => void;
@@ -129,6 +142,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   inventory: null,
   classCounts: {},
   scanning: false,
+  preparingMap: false,
   scanProgress: null,
   selection: emptySelection(),
   options: {
@@ -140,6 +154,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
     includeFrontMatter: false,
     normalizeLineEndings: true,
     maxFileBytes: null,
+    includeProjectMap: true,
   },
   bundle: null,
   building: false,
@@ -167,6 +182,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   openProject: async (path) => {
+    const startedOn = get().route;
     try {
       const response = await api.openProject(path);
       set({
@@ -183,13 +199,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
       get()
         .loadRemoteStatus()
         .catch(() => undefined);
-      await get().scan();
+      await get().scan({ stayOnPage: true });
       // Opening a repository should not begin with an empty canvas and a
       // hundred checkboxes. Rescan deliberately does not do this.
       if (get().selection.files.size === 0) {
         await get().applyRecipe("source_only");
       }
-      await get().loadContext();
+      await get().prepareMapAndContinue(startedOn);
     } catch (error) {
       set({ error: toAppError(error) });
     }
@@ -209,13 +225,18 @@ export const useAppStore = create<AppStore>((set, get) => ({
     });
   },
 
-  scan: async () => {
+  scan: async (options) => {
     set({ scanning: true, error: null, scanProgress: null });
     try {
       const response = await api.scanProject();
       const currentRoute = get().route;
+      // Strictly `true`: `scan` is also a click handler, and an event object
+      // must not count as the option.
       const targetRoute =
-        currentRoute === "overview" || currentRoute === "workspace" ? "context" : currentRoute;
+        options?.stayOnPage !== true &&
+        (currentRoute === "overview" || currentRoute === "workspace")
+          ? "context"
+          : currentRoute;
       set({
         inventory: response.inventory,
         classCounts: response.classCounts,
@@ -325,8 +346,13 @@ export const useAppStore = create<AppStore>((set, get) => ({
     set((state) => ({ options: { ...state.options, ...partial }, bundle: null })),
 
   buildBundle: async () => {
-    const { selection, options } = get();
-    if (selection.files.size === 0 && selection.directories.size === 0) {
+    const { selection, options, inventory } = get();
+    // With the project map on, there is something to show and copy even
+    // before any file is picked, but only once a project is open.
+    if (
+      !inventory ||
+      (selection.files.size === 0 && selection.directories.size === 0 && !options.includeProjectMap)
+    ) {
       set({ bundle: null });
       return;
     }
@@ -348,13 +374,67 @@ export const useAppStore = create<AppStore>((set, get) => ({
     }
   },
 
-  generateContext: async () => {
+  generateContext: async (replaceExisting) => {
     try {
-      const context = await api.generateContext();
-      set({ context, notice: "Context index generated.", error: null });
+      // Strictly `true`: this is also used as a click handler, whose event
+      // argument must never count as consent to replace a file.
+      const context = await api.generateContext(replaceExisting === true);
+      set({
+        context,
+        notice:
+          context.file.state === "current"
+            ? "PROJECT_CONTEXT.md saved in the project folder and excluded from Git."
+            : "Project map updated in LeanAI. PROJECT_CONTEXT.md in the project was left unchanged.",
+        error: null,
+      });
+      return context;
     } catch (error) {
       set({ error: toAppError(error) });
+      return null;
     }
+  },
+
+  prepareMapAndContinue: async (startedOn) => {
+    if (!get().inventory) return;
+    set({ preparingMap: true });
+    let context: ContextResponse | null = null;
+    try {
+      await get().loadContext();
+      context = get().context;
+      if (!context || context.freshness === "stale") {
+        context = await get().generateContext();
+      }
+    } finally {
+      set({ preparingMap: false });
+    }
+    // Never pull the user away from a page they moved to while this ran.
+    if (get().route !== startedOn) return;
+    if (!context) {
+      // No map: land where opening a project used to.
+      if (startedOn === "overview" || startedOn === "workspace") set({ route: "context" });
+      return;
+    }
+    if (context.file.canReplace) {
+      // A decision about the existing PROJECT_CONTEXT.md is waiting there.
+      set({
+        route: "context",
+        notice: "This project already has a PROJECT_CONTEXT.md. Choose whether to replace it.",
+      });
+      return;
+    }
+    const name = get().project?.displayName ?? "this project";
+    set({
+      route: "tasks",
+      notice:
+        context.file.state === "current"
+          ? `Project map ready. Ask LeanAI anything about ${name}.`
+          : `Project map ready (kept inside LeanAI; PROJECT_CONTEXT.md in the project was left unchanged). Ask LeanAI anything about ${name}.`,
+    });
+  },
+
+  regenerateMap: async (replaceExisting) => {
+    const context = await get().generateContext(replaceExisting === true);
+    if (context && !context.file.canReplace) set({ route: "tasks" });
   },
 
   setTheme: (theme) => {
@@ -427,6 +507,7 @@ export const useAppStore = create<AppStore>((set, get) => ({
   },
 
   cloneRepository: async (request: CloneRepositoryRequest) => {
+    const startedOn = get().route;
     try {
       const response = await api.cloneRemoteRepository(request);
       set({
@@ -444,16 +525,32 @@ export const useAppStore = create<AppStore>((set, get) => ({
       get()
         .loadRemoteStatus()
         .catch(() => undefined);
-      await get().scan();
+      await get().scan({ stayOnPage: true });
       // Opening a repository should not begin with an empty canvas and a
       // hundred checkboxes. Rescan deliberately does not do this.
       if (get().selection.files.size === 0) {
         await get().applyRecipe("source_only");
       }
-      await get().loadContext();
+      await get().prepareMapAndContinue(startedOn);
+
+      // Set last: `scan()` and the source recipe above both reset errors and
+      // notices, and would otherwise wipe this. It is a persistent banner
+      // rather than a toast because it describes a broken token that will make
+      // the next private clone fail.
+      if (response.authNotice) {
+        set({
+          error: {
+            code: "github_token_rejected",
+            message: response.authNotice,
+            recovery: "Open Settings → Git and reconnect GitHub with a new token.",
+            retryable: false,
+          },
+        });
+      }
     } catch (error) {
       const appErr = toAppError(error);
-      set({ error: appErr });
+      // Stopping a clone is the user's choice, not a failure worth a red banner.
+      set(appErr.code === "clone_cancelled" ? { notice: "Clone stopped." } : { error: appErr });
       throw appErr;
     }
   },

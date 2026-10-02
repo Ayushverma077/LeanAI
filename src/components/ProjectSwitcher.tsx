@@ -4,13 +4,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { api, toAppError } from "../ipc/client";
 import type { ProjectRecord } from "../ipc/types";
 import { useAppStore } from "../store/useAppStore";
-import {
-  CheckIcon,
-  ChevronDownIcon,
-  FolderIcon,
-  GithubIcon,
-  XIcon,
-} from "./icons";
+import { CheckIcon, ChevronDownIcon, FolderIcon, GithubIcon, XIcon } from "./icons";
 
 /**
  * Switches the open repository.

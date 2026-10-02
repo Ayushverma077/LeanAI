@@ -103,13 +103,29 @@ export function classChip(entry: FileEntry) {
         </Chip>
       );
     case "binary":
-      return <Chip title={entry.exclusion?.reason} className="shrink-0">binary</Chip>;
+      return (
+        <Chip title={entry.exclusion?.reason} className="shrink-0">
+          binary
+        </Chip>
+      );
     case "lockfile":
-      return <Chip title={entry.exclusion?.reason} className="shrink-0">lockfile</Chip>;
+      return (
+        <Chip title={entry.exclusion?.reason} className="shrink-0">
+          lockfile
+        </Chip>
+      );
     case "generated":
-      return <Chip title={entry.exclusion?.reason} className="shrink-0">generated</Chip>;
+      return (
+        <Chip title={entry.exclusion?.reason} className="shrink-0">
+          generated
+        </Chip>
+      );
     case "hidden_metadata":
-      return <Chip title={entry.exclusion?.reason} className="shrink-0">hidden</Chip>;
+      return (
+        <Chip title={entry.exclusion?.reason} className="shrink-0">
+          hidden
+        </Chip>
+      );
     case "symlink":
       return (
         <Chip tone="warn" title={entry.exclusion?.reason} className="shrink-0">

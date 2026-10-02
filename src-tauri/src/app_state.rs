@@ -55,6 +55,94 @@ pub struct ProjectSession {
     pub inventory: Arc<Inventory>,
 }
 
+/// The clone currently in progress, so the UI can cancel it and the app can
+/// stop it on exit.
+///
+/// Without this a clone outlived the app: when `tauri dev` restarted, the
+/// running `git clone` was re-parented to launchd and kept downloading, and
+/// one report of a slow clone turned out to be two 1.1 GB clones splitting the
+/// same connection.
+#[derive(Default)]
+pub struct CloneJob {
+    child: Mutex<Option<std::process::Child>>,
+    cancelled: std::sync::atomic::AtomicBool,
+}
+
+impl CloneJob {
+    pub fn attach(&self, child: std::process::Child) {
+        if let Ok(mut guard) = self.child.lock() {
+            *guard = Some(child);
+        }
+    }
+
+    /// Waits for the attached process to exit, and detaches it.
+    ///
+    /// Only called once git's output has closed, i.e. once it has exited, so
+    /// the process is never out of `cancel`'s reach while it is running.
+    pub fn wait(&self) -> std::io::Result<std::process::ExitStatus> {
+        let child = self
+            .child
+            .lock()
+            .map_err(|_| std::io::Error::other("the clone lock was poisoned"))?
+            .take();
+        match child {
+            Some(mut child) => child.wait(),
+            None => Err(std::io::Error::other("no clone process is attached")),
+        }
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Stops the clone and everything git started for it. Returns false when
+    /// no process was running.
+    ///
+    /// On Unix this is SIGTERM to git's whole process group (it runs in its
+    /// own), rather than SIGKILL, so git's own handler deletes the
+    /// half-written directory. Windows has no equivalent, so there the process
+    /// tree is terminated and the caller removes the folder.
+    pub fn cancel(&self) -> bool {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let Ok(mut guard) = self.child.lock() else {
+            return false;
+        };
+        let Some(child) = guard.as_mut() else {
+            return false;
+        };
+        let pid = child.id();
+
+        #[cfg(unix)]
+        {
+            let signalled = std::process::Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if !signalled {
+                let _ = child.kill();
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let _ = std::process::Command::new("taskkill")
+                .args(["/T", "/F", "/PID", &pid.to_string()])
+                .creation_flags(CREATE_NO_WINDOW)
+                .status();
+            let _ = child.kill();
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = pid;
+            let _ = child.kill();
+        }
+        true
+    }
+}
+
 /// Process-wide state.
 ///
 /// Every field is guarded independently and no lock is ever held across an
@@ -64,11 +152,16 @@ pub struct AppState {
     db: Mutex<Connection>,
     session: Mutex<Option<ProjectSession>>,
     scan_cancel: Mutex<Option<CancelToken>>,
+    clone_job: Mutex<Option<Arc<CloneJob>>>,
     settings: Mutex<Settings>,
     pub database_path: PathBuf,
     pub schema_version: u32,
     pub sidecar: Arc<crate::sidecar_manager::SidecarManager>,
     pub keychain: Arc<crate::keychain::KeychainStore>,
+    /// Held while the project map is generated and written, so two builds
+    /// (for example opening a project while the Context page refreshes) never
+    /// race on PROJECT_CONTEXT.md. Async, because it is held across awaits.
+    pub context_gate: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -87,11 +180,13 @@ impl AppState {
             db: Mutex::new(connection),
             session: Mutex::new(None),
             scan_cancel: Mutex::new(None),
+            clone_job: Mutex::new(None),
             settings: Mutex::new(settings),
             database_path,
             schema_version,
             sidecar: Arc::new(crate::sidecar_manager::SidecarManager::new()),
             keychain: Arc::new(crate::keychain::KeychainStore::new()),
+            context_gate: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -184,5 +279,36 @@ impl AppState {
         if let Ok(mut guard) = self.scan_cancel.lock() {
             *guard = None;
         }
+    }
+
+    /// Registers a new clone. Only one runs at a time: two large downloads
+    /// split the connection and both crawl.
+    pub fn begin_clone(&self) -> AppResult<Arc<CloneJob>> {
+        let mut guard = self
+            .clone_job
+            .lock()
+            .map_err(|_| AppError::internal("the clone lock was poisoned"))?;
+        if guard.is_some() {
+            return Err(AppError::new(
+                "clone_in_progress",
+                "A repository is already being cloned.",
+            )
+            .with_recovery("Wait for it to finish, or stop it first."));
+        }
+        let job = Arc::new(CloneJob::default());
+        *guard = Some(job.clone());
+        Ok(job)
+    }
+
+    pub fn end_clone(&self) {
+        if let Ok(mut guard) = self.clone_job.lock() {
+            *guard = None;
+        }
+    }
+
+    /// Cancels the clone in progress. Returns false when nothing was running.
+    pub fn cancel_clone(&self) -> bool {
+        let job = self.clone_job.lock().ok().and_then(|guard| guard.clone());
+        job.is_some_and(|job| job.cancel())
     }
 }

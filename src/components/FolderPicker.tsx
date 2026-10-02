@@ -88,9 +88,7 @@ export function FolderPicker({
                   ref={(element) => {
                     if (element) element.indeterminate = state === "some";
                   }}
-                  onChange={(event) =>
-                    onToggleDirectory(row.path, event.target.checked, row.files)
-                  }
+                  onChange={(event) => onToggleDirectory(row.path, event.target.checked, row.files)}
                   aria-label={`Add folder ${row.path} — ${row.files.length} files, ${formatBytes(
                     row.bytes,
                   )}, currently ${state === "all" ? "all selected" : state === "some" ? `${hits} of ${row.files.length} selected` : "not selected"}`}

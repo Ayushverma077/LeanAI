@@ -11,7 +11,9 @@ function file(path: string, sizeBytes = 100, selectable = true): FileEntry {
     sizeBytes,
     class: selectable ? "source_text" : "binary",
     selectable,
-    exclusion: selectable ? null : { source: "LeanAiPolicy", reason: "Binary file type.", rule: null },
+    exclusion: selectable
+      ? null
+      : { source: "LeanAiPolicy", reason: "Binary file type.", rule: null },
     contentHash: "h",
     modifiedMs: 0,
   };

@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { save } from "@tauri-apps/plugin-dialog";
 
 import { Button, Chip, EmptyState, Panel } from "../components/primitives";
 import { api, toAppError } from "../ipc/client";
@@ -31,7 +30,8 @@ export function ContextPage() {
             LeanAI builds a Markdown index of this project — structure, modules, dependencies,
             routes, configuration and TODOs — where every section records the files and content
             hashes it was generated from. It is written by ordinary code, not a model, and it does
-            not replace reading the source.
+            not replace reading the source. Generation automatically saves PROJECT_CONTEXT.md in
+            this project and excludes it from Git.
           </>
         }
         action={
@@ -56,30 +56,7 @@ export function ContextPage() {
             <span className="mono">{context.document.sourceRevision.slice(0, 24)}</span>
           </>
         }
-        actions={
-          <>
-            <Button onClick={store.generateContext}>Regenerate</Button>
-            <Button
-              variant="primary"
-              onClick={async () => {
-                const target = await save({
-                  title: "Save context index",
-                  defaultPath: "PROJECT_CONTEXT.md",
-                  filters: [{ name: "Markdown", extensions: ["md"] }],
-                });
-                if (!target) return;
-                try {
-                  await api.saveContextDocument(target);
-                  store.setNotice(`Saved to ${target}.`);
-                } catch (error) {
-                  store.setError(toAppError(error));
-                }
-              }}
-            >
-              Save as…
-            </Button>
-          </>
-        }
+        actions={<Button onClick={store.generateContext}>Regenerate</Button>}
       >
         <div className="flex flex-wrap gap-2">
           <Chip tone={tone}>

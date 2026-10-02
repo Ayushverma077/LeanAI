@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod git;
 pub mod models;
 pub mod projects;
+pub mod prompt;
 pub mod settings;
 
 use serde::Serialize;

@@ -157,6 +157,10 @@ impl BundleManifest {
         ));
         out.push_str(&format!("  include_tree: {}\n", self.options.include_tree));
         out.push_str(&format!(
+            "  include_project_map: {}\n",
+            self.options.include_project_map
+        ));
+        out.push_str(&format!(
             "  normalize_line_endings: {}\n",
             self.options.normalize_line_endings
         ));

@@ -58,8 +58,8 @@ Reproduced in every generated report:
 - Provider-exact token counts. Every number is a local `cl100k_base` estimate.
 - Answer quality, correctness, and the human correction time afterwards.
 
-All six need a real provider run, which LeanAI 0.1 cannot do because it has no
-network capability. Until they are measured on controlled repositories, **no
+All six need a real provider run on controlled repositories, which has not been
+done yet. Until they are measured on controlled repositories, **no
 LeanAI surface may state a token- or cost-savings percentage** (Instructions §2,
 N.3).
 
@@ -75,6 +75,11 @@ Against this repository, one planning task, ground truth of three files:
 | LeanAI hybrid | 3 | 20,330 | 448 ms | 100 % | 100 % |
 
 Machine: macOS / aarch64, 8 cores, policy v1, `cl100k_base`.
+
+> This run (2026-09-06) used the version 1 context format. The version 2
+> format (ADR 0014, 2026-09-27) is much shorter: for this repository about
+> 2,400 tokens instead of about 23,000. The `repo map only` and `LeanAI
+> hybrid` rows are out of date until `leanai-bench` is run again.
 
 **How to read this, and how not to.** The hybrid context is about 6 % the size
 of the raw bundle for this task. That is a real difference in assembled size and

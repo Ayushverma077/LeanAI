@@ -47,13 +47,6 @@ export function CompressionHero() {
               <ZapIcon size={12} />
               <span>Launch Context Studio</span>
             </button>
-            <button
-              type="button"
-              onClick={() => setRoute("agents")}
-              className="inline-flex items-center gap-1.5 rounded-md border border-ink-750 bg-ink-850 px-3 py-1.5 text-xs font-medium text-ink-300 hover:bg-ink-800 hover:text-white transition-colors"
-            >
-              <span>View Agent Fleet →</span>
-            </button>
           </div>
         </div>
 

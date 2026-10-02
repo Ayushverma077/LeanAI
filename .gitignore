@@ -45,3 +45,4 @@ data/
 # Local model files can be large and are registered outside source control
 models/
 *.gguf
+/PROJECT_CONTEXT.md

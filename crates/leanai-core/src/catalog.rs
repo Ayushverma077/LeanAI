@@ -15,6 +15,103 @@ pub struct ModelPrice {
     pub currency: String,
 }
 
+/// Capability tier used by the prompt router. Ordered: a higher tier is more
+/// capable and, as a rule, more expensive.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTier {
+    #[default]
+    Fast,
+    Balanced,
+    Powerful,
+}
+
+impl ModelTier {
+    pub fn label(&self) -> &'static str {
+        match self {
+            ModelTier::Fast => "fast",
+            ModelTier::Balanced => "balanced",
+            ModelTier::Powerful => "powerful",
+        }
+    }
+}
+
+/// Relative strengths on a 0-10 scale. The router compares a prompt's
+/// required strengths against these, so two prompts with the same complexity
+/// can still need different models (a story needs creativity, a migration
+/// needs coding and reasoning).
+///
+/// These are tunable defaults, not benchmarks: they live here, in one place,
+/// so re-rating a model never means touching routing logic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelStrengths {
+    pub coding: f64,
+    pub reasoning: f64,
+    pub creativity: f64,
+    pub long_context: f64,
+    pub instruction_following: f64,
+}
+
+impl ModelStrengths {
+    pub const fn new(
+        coding: f64,
+        reasoning: f64,
+        creativity: f64,
+        long_context: f64,
+        instruction_following: f64,
+    ) -> Self {
+        Self {
+            coding,
+            reasoning,
+            creativity,
+            long_context,
+            instruction_following,
+        }
+    }
+
+    /// Dimensions where `self` (a model) falls short of `required`.
+    pub fn shortfalls(&self, required: &ModelStrengths) -> Vec<&'static str> {
+        let pairs = [
+            ("coding", self.coding, required.coding),
+            ("reasoning", self.reasoning, required.reasoning),
+            ("creativity", self.creativity, required.creativity),
+            ("long-context", self.long_context, required.long_context),
+            (
+                "instruction-following",
+                self.instruction_following,
+                required.instruction_following,
+            ),
+        ];
+        pairs
+            .into_iter()
+            .filter(|(_, have, need)| have + 1e-9 < *need)
+            .map(|(name, _, _)| name)
+            .collect()
+    }
+
+    /// Default strengths for a model known only by its tier, such as a
+    /// self-hosted model the user registered. Deliberately conservative: the
+    /// router may escalate, but should not over-trust an unknown model.
+    pub fn for_tier(tier: ModelTier) -> Self {
+        match tier {
+            ModelTier::Fast => Self::new(5.0, 4.0, 5.0, 5.0, 6.0),
+            ModelTier::Balanced => Self::new(7.0, 7.0, 7.0, 7.0, 8.0),
+            ModelTier::Powerful => Self::new(9.0, 9.0, 8.0, 9.0, 9.0),
+        }
+    }
+
+    pub fn total(&self) -> f64 {
+        self.coding
+            + self.reasoning
+            + self.creativity
+            + self.long_context
+            + self.instruction_following
+    }
+}
+
 /// Catalog entry describing pricing and capabilities for a model.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -25,6 +122,59 @@ pub struct CatalogEntry {
     pub context_cap: usize,
     pub pricing: ModelPrice,
     pub capabilities: CapabilityProfile,
+    #[serde(default)]
+    pub tier: ModelTier,
+    #[serde(default)]
+    pub strengths: ModelStrengths,
+    /// The model name sent to the provider API, when it differs from the part
+    /// of `model_id` after the `provider/` prefix.
+    #[serde(default)]
+    pub api_model: Option<String>,
+}
+
+/// Provider name for models the user hosts themselves behind an
+/// OpenAI-compatible API (Ollama, vLLM, LM Studio, llama.cpp server, ...).
+pub const SELF_HOSTED_PROVIDER: &str = "custom";
+
+impl CatalogEntry {
+    /// A self-hosted model. It costs nothing per token, so the router prefers
+    /// it whenever its tier and strengths are sufficient.
+    pub fn self_hosted(
+        id: &str,
+        display_name: &str,
+        api_model: &str,
+        context_cap: usize,
+        tier: ModelTier,
+    ) -> Self {
+        let mut entry = entry(
+            &format!("{SELF_HOSTED_PROVIDER}/{id}"),
+            display_name,
+            SELF_HOSTED_PROVIDER,
+            context_cap,
+            (0.0, 0.0, Some(0.0)),
+            tier,
+            ModelStrengths::for_tier(tier),
+            false,
+        );
+        entry.api_model = Some(api_model.to_string());
+        entry
+    }
+
+    /// True for models that run on hardware the user controls.
+    pub fn is_private(&self) -> bool {
+        self.provider == "local" || self.provider == SELF_HOSTED_PROVIDER
+    }
+
+    /// The identifier the provider's API expects.
+    pub fn api_model_name(&self) -> &str {
+        if let Some(name) = &self.api_model {
+            return name;
+        }
+        self.model_id
+            .split_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(&self.model_id)
+    }
 }
 
 /// Versioned, timestamped model and pricing catalog (ADR 0008).
@@ -77,118 +227,117 @@ impl PriceCatalog {
     }
 
     /// Default bundled official catalog baseline.
+    ///
+    /// This is the single place provider model names live. Routing logic
+    /// only ever sees tiers, strengths, prices and context caps.
     pub fn default_catalog() -> Self {
         Self {
-            version: "2026-09-06.1".to_string(),
-            updated_at_ms: 1788675700000,
+            version: "2026-09-22.1".to_string(),
+            updated_at_ms: 1790058100000,
             update_source: "official_provider_pricing".to_string(),
             entries: vec![
-                CatalogEntry {
-                    model_id: "openai/gpt-4o-mini".to_string(),
-                    display_name: "GPT-4o mini".to_string(),
-                    provider: "openai".to_string(),
-                    context_cap: 128_000,
-                    pricing: ModelPrice {
-                        input_usd_per_1m: 0.15,
-                        output_usd_per_1m: 0.60,
-                        cached_input_usd_per_1m: Some(0.075),
-                        currency: "USD".to_string(),
-                    },
-                    capabilities: CapabilityProfile {
-                        context_cap: 128_000,
-                        streaming: true,
-                        tool_calling: true,
-                        structured_output: true,
-                        vision: true,
-                        exact_token_counting: false,
-                        cached_token_policy: CachedTokenPolicy::PromptPrefix,
-                    },
-                },
-                CatalogEntry {
-                    model_id: "openai/gpt-4o".to_string(),
-                    display_name: "GPT-4o".to_string(),
-                    provider: "openai".to_string(),
-                    context_cap: 128_000,
-                    pricing: ModelPrice {
-                        input_usd_per_1m: 2.50,
-                        output_usd_per_1m: 10.00,
-                        cached_input_usd_per_1m: Some(1.25),
-                        currency: "USD".to_string(),
-                    },
-                    capabilities: CapabilityProfile {
-                        context_cap: 128_000,
-                        streaming: true,
-                        tool_calling: true,
-                        structured_output: true,
-                        vision: true,
-                        exact_token_counting: false,
-                        cached_token_policy: CachedTokenPolicy::PromptPrefix,
-                    },
-                },
-                CatalogEntry {
-                    model_id: "anthropic/claude-3-5-haiku".to_string(),
-                    display_name: "Claude 3.5 Haiku".to_string(),
-                    provider: "anthropic".to_string(),
-                    context_cap: 200_000,
-                    pricing: ModelPrice {
-                        input_usd_per_1m: 0.80,
-                        output_usd_per_1m: 4.00,
-                        cached_input_usd_per_1m: Some(0.08),
-                        currency: "USD".to_string(),
-                    },
-                    capabilities: CapabilityProfile {
-                        context_cap: 200_000,
-                        streaming: true,
-                        tool_calling: true,
-                        structured_output: true,
-                        vision: true,
-                        exact_token_counting: false,
-                        cached_token_policy: CachedTokenPolicy::PromptPrefix,
-                    },
-                },
-                CatalogEntry {
-                    model_id: "anthropic/claude-3-5-sonnet".to_string(),
-                    display_name: "Claude 3.5 Sonnet".to_string(),
-                    provider: "anthropic".to_string(),
-                    context_cap: 200_000,
-                    pricing: ModelPrice {
-                        input_usd_per_1m: 3.00,
-                        output_usd_per_1m: 15.00,
-                        cached_input_usd_per_1m: Some(0.30),
-                        currency: "USD".to_string(),
-                    },
-                    capabilities: CapabilityProfile {
-                        context_cap: 200_000,
-                        streaming: true,
-                        tool_calling: true,
-                        structured_output: true,
-                        vision: true,
-                        exact_token_counting: false,
-                        cached_token_policy: CachedTokenPolicy::PromptPrefix,
-                    },
-                },
-                CatalogEntry {
-                    model_id: "local/qwen2.5-coder-7b".to_string(),
-                    display_name: "Qwen 2.5 Coder 7B (GGUF)".to_string(),
-                    provider: "local".to_string(),
-                    context_cap: 32_768,
-                    pricing: ModelPrice {
-                        input_usd_per_1m: 0.0,
-                        output_usd_per_1m: 0.0,
-                        cached_input_usd_per_1m: Some(0.0),
-                        currency: "USD".to_string(),
-                    },
-                    capabilities: CapabilityProfile {
-                        context_cap: 32_768,
-                        streaming: true,
-                        tool_calling: false,
-                        structured_output: true,
-                        vision: false,
-                        exact_token_counting: false,
-                        cached_token_policy: CachedTokenPolicy::None,
-                    },
-                },
+                entry(
+                    "openai/gpt-4o-mini",
+                    "GPT-4o mini",
+                    "openai",
+                    128_000,
+                    (0.15, 0.60, Some(0.075)),
+                    ModelTier::Fast,
+                    ModelStrengths::new(5.0, 4.0, 6.0, 5.0, 6.0),
+                    true,
+                ),
+                entry(
+                    "openai/gpt-4o",
+                    "GPT-4o",
+                    "openai",
+                    128_000,
+                    (2.50, 10.00, Some(1.25)),
+                    ModelTier::Balanced,
+                    ModelStrengths::new(7.0, 7.0, 8.0, 6.0, 8.0),
+                    true,
+                ),
+                entry(
+                    "anthropic/claude-haiku-4-5",
+                    "Claude Haiku 4.5",
+                    "anthropic",
+                    200_000,
+                    (1.00, 5.00, Some(0.10)),
+                    ModelTier::Fast,
+                    ModelStrengths::new(6.0, 5.0, 6.0, 6.0, 7.0),
+                    true,
+                ),
+                entry(
+                    "anthropic/claude-sonnet-5",
+                    "Claude Sonnet 5",
+                    "anthropic",
+                    1_000_000,
+                    (2.00, 10.00, Some(0.20)),
+                    ModelTier::Balanced,
+                    ModelStrengths::new(9.0, 8.0, 8.0, 9.0, 9.0),
+                    true,
+                ),
+                entry(
+                    "anthropic/claude-opus-5",
+                    "Claude Opus 5",
+                    "anthropic",
+                    1_000_000,
+                    (5.00, 25.00, Some(0.50)),
+                    ModelTier::Powerful,
+                    ModelStrengths::new(10.0, 10.0, 9.0, 10.0, 10.0),
+                    true,
+                ),
+                entry(
+                    "local/qwen2.5-coder-7b",
+                    "Qwen 2.5 Coder 7B (GGUF)",
+                    "local",
+                    32_768,
+                    (0.0, 0.0, Some(0.0)),
+                    ModelTier::Fast,
+                    ModelStrengths::new(4.0, 3.0, 3.0, 3.0, 4.0),
+                    false,
+                ),
             ],
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn entry(
+    model_id: &str,
+    display_name: &str,
+    provider: &str,
+    context_cap: usize,
+    (input, output, cached): (f64, f64, Option<f64>),
+    tier: ModelTier,
+    strengths: ModelStrengths,
+    cloud: bool,
+) -> CatalogEntry {
+    CatalogEntry {
+        model_id: model_id.to_string(),
+        display_name: display_name.to_string(),
+        provider: provider.to_string(),
+        context_cap,
+        pricing: ModelPrice {
+            input_usd_per_1m: input,
+            output_usd_per_1m: output,
+            cached_input_usd_per_1m: cached,
+            currency: "USD".to_string(),
+        },
+        capabilities: CapabilityProfile {
+            context_cap,
+            streaming: true,
+            tool_calling: cloud,
+            structured_output: true,
+            vision: cloud,
+            exact_token_counting: false,
+            cached_token_policy: if cloud {
+                CachedTokenPolicy::PromptPrefix
+            } else {
+                CachedTokenPolicy::None
+            },
+        },
+        tier,
+        strengths,
+        api_model: None,
     }
 }

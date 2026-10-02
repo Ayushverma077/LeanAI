@@ -9,7 +9,7 @@ fn inventory_of(root: &std::path::Path) -> leanai_core::inventory::Inventory {
     scan(root, &ScanOptions::default(), &CancelToken::new(), |_| {}).unwrap()
 }
 
-/// §8.3: every required section is present, in the specified order.
+/// Every section is present, in order (ADR 0014 replaces the §8.3 list).
 #[test]
 fn document_contains_every_required_section_in_order() {
     let fixture = support::small_app();
@@ -71,19 +71,23 @@ fn sections_disclose_their_limitations() {
     .unwrap();
 
     for key in [
+        "overview",
+        "structure",
         "key_modules",
         "api_contracts",
         "dependencies",
-        "core_architecture",
     ] {
         assert!(
             !document.section(key).unwrap().limitations.is_empty(),
             "{key} must state what it cannot determine"
         );
     }
+    // The file stays short: limitations live in the stored document and the
+    // app, and the file says where to find them.
     let markdown = context::render(&document);
-    assert!(markdown.contains("**Limitations**"));
-    assert!(markdown.contains("not** a replacement for reading the code"));
+    assert!(!markdown.contains("**Limitations**"));
+    assert!(markdown.contains("not a replacement for reading the code"));
+    assert!(markdown.contains("shown in LeanAI under Context"));
 }
 
 /// FR-19: changing a cited file marks the dependent sections stale.
@@ -109,7 +113,7 @@ fn changed_files_invalidate_dependent_sections() {
     assert!(impact.changed_files.contains(&"src/greet.ts".to_string()));
     assert!(impact.stale_sections.contains(&"key_modules".to_string()));
     assert_eq!(document.freshness(), Freshness::Stale);
-    assert!(context::render(&document).contains("STALE"));
+    assert!(context::render(&document).contains("**Stale:**"));
 }
 
 /// FR-19: a new file invalidates structural sections even though it is cited
@@ -132,12 +136,8 @@ fn added_files_conservatively_invalidate_structural_sections() {
     assert!(impact
         .added_files
         .contains(&"src/new-module.ts".to_string()));
-    assert!(impact
-        .stale_sections
-        .contains(&"directory_structure".to_string()));
-    assert!(impact
-        .stale_sections
-        .contains(&"file_inventory".to_string()));
+    assert!(impact.stale_sections.contains(&"structure".to_string()));
+    assert!(impact.stale_sections.contains(&"overview".to_string()));
 }
 
 /// A deleted source is reported and its sections go stale.
@@ -286,7 +286,7 @@ fn model_written_sections_are_labelled_in_the_output() {
     let summary = document
         .sections
         .iter_mut()
-        .find(|section| section.key == "summary")
+        .find(|section| section.key == "overview")
         .unwrap();
     summary.generator = Generator::Model {
         provider: "acme".to_string(),
@@ -297,4 +297,86 @@ fn model_written_sections_are_labelled_in_the_output() {
     let markdown = context::render(&document);
     assert!(markdown.contains("Written by `acme/writer-1`"));
     assert!(markdown.contains("documenter/v3"));
+}
+
+/// Prompt routing: only the requested sections are rendered, and the result
+/// never exceeds the budget, however large the full document is.
+#[test]
+fn render_sections_is_selective_and_bounded() {
+    let fixture = support::small_app();
+    let inventory = inventory_of(fixture.root());
+    let document = context::generate(
+        fixture.root(),
+        &inventory,
+        &context::GenerateOptions::default(),
+    )
+    .unwrap();
+    let full = context::render(&document);
+    let full_tokens = leanai_core::tokenizer::estimate(&full).value;
+
+    let keys = vec!["overview".to_string(), "structure".to_string()];
+    let (text, tokens) = context::render_sections(&document, &keys, 10_000);
+    assert!(text.contains("## Overview"));
+    assert!(text.contains("## Structure"));
+    assert!(!text.contains("## Key Modules"));
+    assert!(
+        !text.contains("<details>"),
+        "provenance lists are not sent to models"
+    );
+    assert!(tokens < full_tokens);
+
+    let (tiny, tiny_tokens) = context::render_sections(&document, &keys, 40);
+    assert!(tiny_tokens <= 60, "{tiny_tokens} tokens: {tiny}");
+    let (none, none_tokens) = context::render_sections(&document, &[], 10_000);
+    assert!(none.is_empty() && none_tokens == 0);
+}
+
+/// ADR 0014: the file is short and plain. No per-section hashes, source
+/// lists or freshness lines, and long lists are capped with a count.
+#[test]
+fn rendered_file_is_short_and_plain() {
+    let fixture = support::monorepo();
+    for i in 0..30 {
+        fixture.file(
+            &format!("pkg/m{i:02}.ts"),
+            &format!("export const a{i} = 1;\nexport function f{i}() {{}}\n"),
+        );
+    }
+    let inventory = inventory_of(fixture.root());
+    let document = context::generate(
+        fixture.root(),
+        &inventory,
+        &context::GenerateOptions::default(),
+    )
+    .unwrap();
+    let markdown = context::render(&document);
+
+    assert!(markdown.starts_with("# Project Context"));
+    assert!(
+        !markdown.contains("<details>"),
+        "no source lists in the file"
+    );
+    assert!(
+        !markdown.contains("generated at revision"),
+        "no per-section revision lines"
+    );
+    assert!(
+        markdown.contains("Revision `"),
+        "one revision line at the top"
+    );
+    // 30 files export names; 20 are listed and the rest counted.
+    let modules = &document.section("key_modules").unwrap().body;
+    assert_eq!(modules.lines().filter(|l| l.starts_with("- `")).count(), 20);
+    assert!(modules.contains("more files that export names"));
+    // Provenance is still recorded for the app.
+    assert!(!document
+        .section("key_modules")
+        .unwrap()
+        .source_refs
+        .is_empty());
+    assert!(
+        markdown.lines().count() < 150,
+        "{} lines",
+        markdown.lines().count()
+    );
 }

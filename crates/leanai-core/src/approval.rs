@@ -273,18 +273,35 @@ fn extract_new_content_from_diff(diff: &str) -> String {
     if lines.is_empty() {
         diff.to_string()
     } else {
-        lines.join("\n")
+        let mut content = lines.join("\n");
+        content.push('\n');
+        content
     }
 }
 
 /// Helper: applies unified diff line additions/deletions to base text.
+///
+/// Context (` `) and removed (`-`) lines must match the base text exactly;
+/// otherwise the patch was produced against different content and applying it
+/// would corrupt the file, so it is rejected. The base's trailing newline is
+/// preserved.
 fn apply_unified_diff_chunk(base: &str, diff: &str) -> Result<String> {
+    let mismatch = |line_no: usize, expected: &str, found: Option<&str>| {
+        CoreError::InvalidSelection(format!(
+            "patch does not apply: line {line_no} expected {:?} but found {:?}",
+            truncate_for_error(expected),
+            found
+                .map(truncate_for_error)
+                .unwrap_or_else(|| "end of file".to_string())
+        ))
+    };
+
     let mut result_lines = Vec::new();
     let base_lines: Vec<&str> = base.lines().collect();
     let mut base_idx = 0;
 
     for line in diff.lines() {
-        if line.starts_with("+++") || line.starts_with("---") {
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with('\\') {
             continue;
         }
         if line.starts_with("@@ -") {
@@ -293,6 +310,12 @@ fn apply_unified_diff_chunk(base: &str, diff: &str) -> Result<String> {
                 if let Some(num_str) = rest.split([',', ' ']).next() {
                     if let Ok(orig_start) = num_str.parse::<usize>() {
                         let target_idx = orig_start.saturating_sub(1);
+                        if target_idx < base_idx {
+                            return Err(CoreError::InvalidSelection(
+                                "patch does not apply: overlapping or out-of-order hunks"
+                                    .to_string(),
+                            ));
+                        }
                         while base_idx < target_idx && base_idx < base_lines.len() {
                             result_lines.push(base_lines[base_idx].to_string());
                             base_idx += 1;
@@ -304,15 +327,19 @@ fn apply_unified_diff_chunk(base: &str, diff: &str) -> Result<String> {
         }
         if let Some(added) = line.strip_prefix('+') {
             result_lines.push(added.to_string());
-        } else if let Some(_deleted) = line.strip_prefix('-') {
-            if base_idx < base_lines.len() {
-                base_idx += 1;
+        } else if let Some(deleted) = line.strip_prefix('-') {
+            match base_lines.get(base_idx) {
+                Some(found) if *found == deleted => base_idx += 1,
+                found => return Err(mismatch(base_idx + 1, deleted, found.copied())),
             }
         } else {
             let unchanged = line.strip_prefix(' ').unwrap_or(line);
-            result_lines.push(unchanged.to_string());
-            if base_idx < base_lines.len() {
-                base_idx += 1;
+            match base_lines.get(base_idx) {
+                Some(found) if *found == unchanged => {
+                    result_lines.push(unchanged.to_string());
+                    base_idx += 1;
+                }
+                found => return Err(mismatch(base_idx + 1, unchanged, found.copied())),
             }
         }
     }
@@ -323,5 +350,38 @@ fn apply_unified_diff_chunk(base: &str, diff: &str) -> Result<String> {
         base_idx += 1;
     }
 
-    Ok(result_lines.join("\n"))
+    let mut output = result_lines.join("\n");
+    if base.ends_with('\n') && !output.is_empty() {
+        output.push('\n');
+    }
+    Ok(output)
+}
+
+fn truncate_for_error(text: &str) -> String {
+    let mut short: String = text.chars().take(80).collect();
+    if text.chars().count() > 80 {
+        short.push('…');
+    }
+    short
+}
+
+#[cfg(test)]
+mod diff_tests {
+    use super::apply_unified_diff_chunk;
+
+    #[test]
+    fn applies_matching_hunk_and_keeps_trailing_newline() {
+        let base = "a\nb\nc\n";
+        let diff = "--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n a\n-b\n+B\n c\n";
+        assert_eq!(apply_unified_diff_chunk(base, diff).unwrap(), "a\nB\nc\n");
+    }
+
+    #[test]
+    fn rejects_context_or_removal_that_does_not_match() {
+        let base = "a\nb\nc\n";
+        let wrong_removal = "@@ -1,3 +1,3 @@\n a\n-x\n+B\n c\n";
+        assert!(apply_unified_diff_chunk(base, wrong_removal).is_err());
+        let wrong_context = "@@ -1,3 +1,3 @@\n z\n-b\n+B\n c\n";
+        assert!(apply_unified_diff_chunk(base, wrong_context).is_err());
+    }
 }

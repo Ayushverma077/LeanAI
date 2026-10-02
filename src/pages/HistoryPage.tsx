@@ -59,9 +59,7 @@ export function HistoryPage() {
         <div>
           <div className="flex items-center gap-2">
             <HistoryIcon size={18} className="text-brand" />
-            <h1 className="text-base font-bold text-white tracking-tight">
-              History & Logs
-            </h1>
+            <h1 className="text-base font-bold text-white tracking-tight">History & Logs</h1>
           </div>
         </div>
 
@@ -82,8 +80,8 @@ export function HistoryPage() {
               type="button"
               onClick={() => setActiveTab("audit")}
               className={`rounded-md px-3 py-1 text-xs font-medium transition-colors ${
-                activeTab === "audit" 
-                  ? "bg-brand text-white shadow-xs" 
+                activeTab === "audit"
+                  ? "bg-brand text-white shadow-xs"
                   : "text-ink-400 hover:text-ink-200"
               }`}
             >

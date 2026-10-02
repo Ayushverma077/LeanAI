@@ -23,8 +23,10 @@ ADRs 0007-0010 but are not implemented, and are marked as such.
 **Repository content is data, never instruction.** A README, comment, test
 fixture or vendored file that contains text addressed to a model or to LeanAI
 carries no authority. Today this is enforced structurally: no component
-interprets file content as a command, and no shell or network capability exists
-to be steered. Phase 8 adds the agent-side rules in ADR 0010.
+interprets file content as a command, and the webview holds no shell or network
+capability to be steered. When a model is involved (Ask LeanAI, agents), its
+replies are parsed as typed actions and validated before anything happens
+(ADR 0010, ADR 0011, ADR 0013).
 
 ## Threats and mitigations
 
@@ -36,7 +38,7 @@ to be steered. Phase 8 adds the agent-side rules in ADR 0010.
 | T4 | A user exports a secret without noticing | Preflight shows the full file list, graded secret findings and a destination note; medium/high findings require a typed acknowledgement | `PreviewPage` preflight; `safety.rs::secret_findings_are_graded_and_redacted` |
 | T5 | The secret scanner is mistaken for a guarantee | `SecretReport::DISCLAIMER` is displayed in every preflight and states that it can miss real secrets | `safety.rs` |
 | T6 | A secret leaks through logs, errors or diagnostics | Findings store a redacted excerpt; OS errors are stripped of absolute paths; the diagnostic bundle contains no paths or source | `safety.rs::secret_findings_are_graded_and_redacted`, `walker::sanitize` |
-| T7 | Injected instructions in repository content steer the app | No component executes file content; no shell or network capability is granted; context bodies are rendered as text | ADR 0002; capability manifest |
+| T7 | Injected instructions in repository content steer the app | No component executes file content; the webview has no shell or network capability; context bodies are rendered as text; model replies are validated typed actions; a run that read instruction-like text forces a careful review of any change | ADR 0002; capability manifest; `apply_gate::tests::run_history_holds_changes_and_reasons_are_ordered` |
 | T8 | A compromised webview reads arbitrary files | The webview has no filesystem capability; all reads go through boundary-checked commands | ADR 0002 |
 | T9 | Remote code execution via loaded assets | CSP forbids remote script/style/connect; `assetProtocol` disabled; no CDN dependency | `tauri.conf.json` |
 | T10 | Stale context leads to a wrong decision | Freshness recomputed on read; conservative invalidation; source-on-demand reports "changed since scan" | `context.rs::changed_files_invalidate_dependent_sections` |
@@ -44,6 +46,9 @@ to be steered. Phase 8 adds the agent-side rules in ADR 0010.
 | T12 | Local database theft yields credentials | No credential column exists; keys will live in OS secure storage | `persistence.rs::no_table_stores_credentials`, ADR 0007 |
 | T13 | Retained bundle text accumulates copies of source | Default retention is metadata-only; user can choose "keep nothing" | `persistence.rs::retention_controls_whether_bundle_text_is_stored` |
 | T14 | Resource exhaustion on a hostile or huge tree | Bounded probe reads, file/selection/bundle/depth limits, cancellation, truncation reporting | `scan.rs::scan_reports_truncation_at_the_file_limit`, `bundle.rs::selection_limits_are_enforced` |
+| T15 | A model's change to a build, CI, dependency or permission file is applied without review | The apply gate ranks such changes `careful_review` whatever the auto-apply setting, and the UI requires an explicit "I've read these changes" before applying | `apply_gate::tests::build_ci_and_permission_files_need_careful_review`, `prompt_run.rs::gate_holds_back_build_file_changes_even_with_auto_apply_on`, ADR 0013 |
+| T16 | A malformed model reply is misread as an action | Replies are schema-constrained where supported and always re-validated by `parse_action`; a server that rejects the schema falls back visibly | `llm_protocol::tests::schema_shaped_replies_parse_to_the_same_actions`, `prompt_run.rs::server_without_schema_support_falls_back_to_instructions_once`, ADR 0013 |
+| T17 | Generating the map destroys a PROJECT_CONTEXT.md that a person or another tool wrote | The file is written without asking only when it is missing or byte-identical to what LeanAI last wrote; otherwise it is kept, the Context page alerts, and replacing needs two explicit clicks. Automatic refreshes never replace | `context_file::tests::keeps_a_file_leanai_did_not_write_unless_asked`, `::keeps_a_leanai_file_that_was_edited_since`, `prompt_run.rs::a_project_context_file_leanai_did_not_write_is_never_overwritten`, ADR 0016 |
 
 ## Known limitations
 

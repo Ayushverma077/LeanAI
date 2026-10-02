@@ -33,6 +33,7 @@ export function OverviewPage() {
     inventory,
     classCounts,
     scanning,
+    preparingMap,
     scanProgress,
     openProject,
     scan,
@@ -177,13 +178,20 @@ export function OverviewPage() {
           </div>
         )}
 
+        {/* After the scan: the project map is built, then Tasks opens. */}
+        {preparingMap && (
+          <div
+            role="status"
+            className="mt-3 flex items-center gap-2 rounded-md border border-ink-750 bg-ink-950/60 px-3 py-2 text-xs text-ink-400"
+          >
+            <RefreshCwIcon size={11} className="animate-spin text-brand shrink-0" />
+            <span>Building the project map… Tasks opens when it is ready.</span>
+          </div>
+        )}
+
         {/* Stats */}
         <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <StatCard
-            label="Files"
-            value={formatNumber(filesSeen)}
-            icon={<FolderIcon size={14} />}
-          />
+          <StatCard label="Files" value={formatNumber(filesSeen)} icon={<FolderIcon size={14} />} />
           <StatCard
             label="Size"
             value={formatBytes(bytesSeen)}

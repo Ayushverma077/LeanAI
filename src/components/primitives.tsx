@@ -156,9 +156,7 @@ export function EmptyState({
 }) {
   return (
     <div className="flex flex-col items-center justify-center gap-3 px-6 py-16 text-center">
-      {icon ? (
-        <div className="mb-1">{icon}</div>
-      ) : null}
+      {icon ? <div className="mb-1">{icon}</div> : null}
       <h3 className="text-sm font-semibold text-ink-100">{title}</h3>
       <p className="max-w-sm text-xs leading-relaxed text-ink-400">{body}</p>
       {action ? <div className="mt-2">{action}</div> : null}

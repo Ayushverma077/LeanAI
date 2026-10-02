@@ -1,26 +1,24 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 import { FileTree } from "../components/FileTree";
 import { FolderPicker } from "../components/FolderPicker";
+import { MiniMarkdown } from "../components/context/MiniMarkdown";
 import {
   Button,
   Chip,
   EmptyState,
   Panel,
-  Toggle,
   formatBytes,
   formatNumber,
 } from "../components/primitives";
-import { TokenGauge } from "../components/context/TokenGauge";
 import { api, toAppError } from "../ipc/client";
 import type {
+  ContextDocument,
+  ContextFileInfo,
   ContextSection,
   DiffScope,
-  FileClass,
   SelectionRecipe,
-  ExportDestination,
   ExportPreflight,
   FileEntry,
   PresetRecord,
@@ -35,30 +33,15 @@ import {
   RefreshCwIcon,
   SearchIcon,
   ShieldCheckIcon,
-  SparklesIcon,
 } from "../components/icons";
-
-/** Plain-language names for the classes shown in the exclusion summary. */
-const EXCLUSION_LABELS: Record<FileClass, string> = {
-  source_text: "Source text",
-  binary: "Binary files",
-  generated: "Generated and vendored output",
-  lockfile: "Dependency lockfiles",
-  credential_sensitive: "Credential-sensitive paths",
-  hidden_metadata: "Hidden and editor metadata",
-  too_large: "Too large for their type",
-  symlink: "Symbolic links",
-  unsupported_encoding: "Unsupported encoding",
-  unreadable: "Unreadable",
-};
 
 export function ContextBundlerPage() {
   const store = useAppStore();
+  const buildBundle = useAppStore((state) => state.buildBundle);
   const { inventory, selection, git, options, bundle, building, context } = store;
 
   // Search & Filter state
   const [search, setSearch] = useState("");
-  const [centerTab, setCenterTab] = useState<"bundle" | "context">("bundle");
   const [browseMode, setBrowseMode] = useState<"files" | "folders">("files");
 
   // Presets & Git diff
@@ -70,20 +53,17 @@ export function ContextBundlerPage() {
 
   // Dialog states
   const [pendingOverride, setPendingOverride] = useState<FileEntry | null>(null);
-  const [preflight, setPreflight] = useState<{
-    data: ExportPreflight;
-    destination: ExportDestination;
-    targetPath: string | null;
-  } | null>(null);
+  const [preflight, setPreflight] = useState<ExportPreflight | null>(null);
   const [inspectedSource, setInspectedSource] = useState<SourceOnDemandResponse | null>(null);
 
-  // Debounced bundle build
+  // Debounced bundle build. Depends on the stable action, not the whole
+  // store, which changes after every build and would rebuild in a loop.
   useEffect(() => {
     const timer = setTimeout(() => {
-      void store.buildBundle();
+      void buildBundle();
     }, 250);
     return () => clearTimeout(timer);
-  }, [selection, options, store]);
+  }, [selection, options, buildBundle]);
 
   const refreshPresets = useCallback(() => {
     api
@@ -110,27 +90,26 @@ export function ContextBundlerPage() {
     return total;
   }, [inventory, selection.files]);
 
-  /**
-   * What the policy kept out, grouped by reason. On a large repository this is
-   * the difference between a bundle that fits a context window and one that
-   * does not, so it belongs on screen rather than buried in the file tree.
-   */
-  const excluded = useMemo(() => {
-    const counts = new Map<FileClass, { files: number; bytes: number }>();
-    for (const file of inventory?.files ?? []) {
-      if (file.selectable) continue;
-      const slot = counts.get(file.class) ?? { files: 0, bytes: 0 };
-      slot.files += 1;
-      slot.bytes += file.sizeBytes;
-      counts.set(file.class, slot);
-    }
-    const rows = [...counts.entries()].sort((a, b) => b[1].bytes - a[1].bytes);
-    return {
-      files: rows.reduce((total, [, slot]) => total + slot.files, 0),
-      bytes: rows.reduce((total, [, slot]) => total + slot.bytes, 0),
-      rows,
-    };
-  }, [inventory]);
+  // The map on screen is the one in the bundle, so what you see is what is
+  // copied; before the first build, fall back to the stored index.
+  const mapDocument = bundle?.projectMap ?? context?.document ?? null;
+  const mapFile = bundle?.projectMapFile ?? context?.file ?? null;
+  const mapIncluded = options.includeProjectMap && (bundle?.projectMap ?? null) !== null;
+  const canCopy = !!bundle && (selection.files.size > 0 || mapIncluded);
+  // What Copy sends, in plain words: the parts, then how big it is.
+  const contents = !bundle
+    ? building
+      ? "Getting things ready…"
+      : "Pick files on the left, or include the project map."
+    : [
+        mapIncluded ? "Project map" : null,
+        bundle.fileCount > 0
+          ? `${formatNumber(bundle.fileCount)} file${bundle.fileCount === 1 ? "" : "s"}`
+          : null,
+      ]
+        .filter(Boolean)
+        .join(" + ");
+  const size = bundle ? sizeGuide(bundle.estimate.value) : null;
 
   if (!inventory) {
     return (
@@ -166,19 +145,10 @@ export function ContextBundlerPage() {
     }
   };
 
-  const handleStartExport = async (destination: ExportDestination) => {
+  const handleStartExport = async () => {
     try {
-      let targetPath: string | null = null;
-      if (destination === "file") {
-        targetPath = await save({
-          title: "Save context bundle",
-          defaultPath: "leanai-bundle.md",
-          filters: [{ name: "Markdown", extensions: ["md", "txt"] }],
-        });
-        if (!targetPath) return;
-      }
-      const data = await api.exportPreflight(toSpec(selection), options, destination, targetPath);
-      setPreflight({ data, destination, targetPath });
+      const data = await api.exportPreflight(toSpec(selection), options, "clipboard", null);
+      setPreflight(data);
     } catch (error) {
       store.setError(toAppError(error));
     }
@@ -187,18 +157,13 @@ export function ContextBundlerPage() {
   const handleConfirmExport = async () => {
     if (!preflight) return;
     try {
-      const response = await api.exportBundle(
-        toSpec(selection),
-        options,
-        preflight.destination,
-        preflight.targetPath,
-      );
+      const response = await api.exportBundle(toSpec(selection), options, "clipboard", null);
       if (response.text !== null) {
         await writeText(response.text);
       }
       store.setNotice(
-        response.writtenPath
-          ? `Saved bundle to ${response.writtenPath} (manifest: ${response.manifestPath}).`
+        preflight.projectMapIncluded
+          ? `Copied the project map and ${preflight.fileCount} file${preflight.fileCount === 1 ? "" : "s"} to the clipboard.`
           : "Context bundle copied to system clipboard.",
       );
       setPreflight(null);
@@ -209,8 +174,8 @@ export function ContextBundlerPage() {
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
-      {/* 3-Pane Studio Layout */}
-      <div className="grid h-full min-h-0 gap-2.5 lg:grid-cols-[300px_minmax(0,1fr)_320px] xl:grid-cols-[320px_minmax(0,1fr)_340px]">
+      {/* File explorer and preview layout */}
+      <div className="grid h-full min-h-0 gap-2.5 lg:grid-cols-[300px_minmax(0,1fr)] xl:grid-cols-[320px_minmax(0,1fr)]">
         {/* PANE 1: File Explorer & Presets */}
         <div className="flex flex-col overflow-hidden rounded-lg border border-ink-800/80 bg-ink-900/60 shadow-2xs">
           {/* Pane Header */}
@@ -374,344 +339,172 @@ export function ContextBundlerPage() {
               <summary className="cursor-pointer list-none text-[11px] text-ink-500 hover:text-ink-300">
                 Presets{presets.length > 0 ? ` (${presets.length})` : ""}
               </summary>
-            <div className="mt-2 flex items-center gap-1.5">
-              <input
-                type="text"
-                value={presetName}
-                onChange={(e) => setPresetName(e.target.value)}
-                placeholder="Name this selection…"
-                className="w-full rounded border border-ink-800 bg-ink-900 px-2 py-1 text-[11px] text-ink-100 placeholder:text-ink-600"
-              />
-              <Button
-                size="xs"
-                disabled={!presetName.trim() || selection.files.size === 0}
-                onClick={async () => {
-                  try {
-                    await api.savePreset(presetName.trim(), toSpec(selection), store.options);
-                    setPresetName("");
-                    refreshPresets();
-                    store.setNotice(`Saved preset "${presetName.trim()}".`);
-                  } catch (err) {
-                    store.setError(toAppError(err));
-                  }
-                }}
-              >
-                Save
-              </Button>
-            </div>
-
-            {presets.length > 0 ? (
-              <div className="mt-2 flex flex-wrap gap-1">
-                {presets.map((p) => (
-                  <button
-                    key={p.id}
-                    type="button"
-                    onClick={() => {
-                      store.selectPaths(p.validation?.files ?? [], true);
-                      store.setOptions(p.options);
-                      store.setNotice(`Applied preset "${p.name}".`);
-                    }}
-                    className="rounded border border-ink-800 bg-ink-900 px-1.5 py-0.5 text-[10px] text-ink-300 hover:border-ink-700 hover:text-ink-100"
-                  >
-                    {p.name} ({p.validation?.files.length ?? 0})
-                  </button>
-                ))}
+              <div className="mt-2 flex items-center gap-1.5">
+                <input
+                  type="text"
+                  value={presetName}
+                  onChange={(e) => setPresetName(e.target.value)}
+                  placeholder="Name this selection…"
+                  className="w-full rounded border border-ink-800 bg-ink-900 px-2 py-1 text-[11px] text-ink-100 placeholder:text-ink-600"
+                />
+                <Button
+                  size="xs"
+                  disabled={!presetName.trim() || selection.files.size === 0}
+                  onClick={async () => {
+                    try {
+                      await api.savePreset(presetName.trim(), toSpec(selection), store.options);
+                      setPresetName("");
+                      refreshPresets();
+                      store.setNotice(`Saved preset "${presetName.trim()}".`);
+                    } catch (err) {
+                      store.setError(toAppError(err));
+                    }
+                  }}
+                >
+                  Save
+                </Button>
               </div>
-            ) : null}
+
+              {presets.length > 0 ? (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {presets.map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => {
+                        store.selectPaths(p.validation?.files ?? [], true);
+                        store.setOptions(p.options);
+                        store.setNotice(`Applied preset "${p.name}".`);
+                      }}
+                      className="rounded border border-ink-800 bg-ink-900 px-1.5 py-0.5 text-[10px] text-ink-300 hover:border-ink-700 hover:text-ink-100"
+                    >
+                      {p.name} ({p.validation?.files.length ?? 0})
+                    </button>
+                  ))}
+                </div>
+              ) : null}
             </details>
           </div>
         </div>
 
-        {/* PANE 2: Live Context Document & Markdown Viewer */}
+        {/* PANE 2: Everything the AI gets, in one place: the project map on
+            top, the chosen files below, one Copy for both (ADR 0015). */}
         <div className="flex flex-col overflow-hidden rounded-lg border border-ink-800/80 bg-ink-900/60 shadow-2xs">
-          {/* Header with Tabs and Actions */}
-          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-ink-800/80 px-3.5 py-2 bg-ink-950/40">
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                onClick={() => setCenterTab("bundle")}
-                className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                  centerTab === "bundle"
-                    ? "bg-ink-800 text-ink-100 shadow-2xs"
-                    : "text-ink-400 hover:text-ink-200"
-                }`}
-              >
-                <FileCodeIcon size={12} className="text-ink-300" />
-                <span>Bundle</span>
-              </button>
-
-              <button
-                type="button"
-                onClick={() => setCenterTab("context")}
-                className={`flex items-center gap-1.5 rounded px-2.5 py-1 text-xs font-medium transition-colors ${
-                  centerTab === "context"
-                    ? "bg-ink-800 text-ink-100 shadow-2xs"
-                    : "text-ink-400 hover:text-ink-200"
-                }`}
-              >
-                <SparklesIcon size={12} className="text-ink-300" />
-                <span>PROJECT_CONTEXT.md</span>
-                {context ? (
-                  <span className="size-1.5 rounded-full bg-ok" />
-                ) : (
-                  <span className="size-1.5 rounded-full bg-warn" />
-                )}
-              </button>
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-ink-800/80 px-3.5 py-2.5 bg-ink-950/40">
+            <div className="min-w-0">
+              <h2 className="text-xs font-semibold text-ink-100">What the AI gets</h2>
+              <p className="text-[11px] text-ink-300">{contents}</p>
+              {bundle && size ? (
+                <p className="text-[11px] text-ink-500">
+                  <span className={`font-semibold ${size.tone}`}>{size.word}</span>{" "}
+                  <span
+                    title={`About ${formatNumber(bundle.estimate.value)} tokens (${bundle.estimateLabel}). Tokens are how AI tools measure text; each AI counts a little differently.`}
+                    className="underline decoration-dotted underline-offset-2"
+                  >
+                    (~{shortNumber(bundle.estimate.value)} tokens)
+                  </span>{" "}
+                  — {size.advice}
+                </p>
+              ) : null}
             </div>
-
-            {/* Export Toolbar */}
-            <div className="ml-auto flex shrink-0 items-center gap-1.5">
-              <Button
-                variant="default"
-                size="xs"
-                disabled={!bundle || selection.files.size === 0}
-                onClick={() => handleStartExport("clipboard")}
-              >
-                <CopyIcon size={12} />
-                <span>Copy</span>
-              </Button>
-              <Button
-                variant="primary"
-                size="xs"
-                className="shrink-0 whitespace-nowrap"
-                disabled={!bundle || selection.files.size === 0}
-                onClick={() => handleStartExport("file")}
-              >
-                <span>Save as…</span>
-              </Button>
-            </div>
+            <Button
+              variant="primary"
+              size="sm"
+              disabled={!canCopy}
+              onClick={() => handleStartExport()}
+            >
+              <CopyIcon size={13} />
+              <span>Copy for AI</span>
+            </Button>
           </div>
 
-          {/* Center Pane Content */}
-          <div className="flex-1 overflow-y-auto p-4">
-            {centerTab === "bundle" ? (
-              selection.files.size === 0 ? (
-                <EmptyState
-                  icon={<FileCodeIcon size={20} />}
-                  title="Nothing selected"
-                  body="Pick files on the left. The bundle preview shows exactly what a model would receive."
-                />
+          <div className="flex-1 space-y-4 overflow-y-auto p-4">
+            <ContextFileAlert
+              file={mapFile}
+              onReplace={async () => {
+                // Replacing is a generation too: afterwards, go on to Tasks.
+                await store.regenerateMap(true);
+                await buildBundle();
+              }}
+            />
+
+            <ProjectMapCard
+              included={options.includeProjectMap}
+              document={mapDocument}
+              onRegenerate={async () => {
+                // Once the map is rebuilt, go on to Tasks to use it.
+                await store.regenerateMap();
+                await buildBundle();
+              }}
+              onInclude={(include) => store.setOptions({ includeProjectMap: include })}
+              onOpenSource={async (path) => {
+                try {
+                  setInspectedSource(await api.fetchSource(path));
+                } catch (err) {
+                  store.setError(toAppError(err));
+                }
+              }}
+            />
+
+            <section aria-label="Selected files" className="space-y-2">
+              <div className="flex items-center justify-between text-xs text-ink-400">
+                <span className="flex items-center gap-1.5 font-semibold text-ink-200">
+                  <FileCodeIcon size={12} className="text-ink-400" />
+                  Selected files
+                  {selection.files.size > 0 ? (
+                    <span className="font-normal text-ink-400">
+                      · {formatNumber(selection.files.size)} files · {formatBytes(selectedBytes)}
+                    </span>
+                  ) : null}
+                </span>
+                {bundle ? (
+                  <span className="mono text-[11px] text-ink-500">
+                    sha256 {bundle.outputHash.slice(0, 16)}…
+                  </span>
+                ) : null}
+              </div>
+
+              {selection.files.size === 0 ? (
+                <p className="rounded-lg border border-dashed border-ink-800 p-4 text-center text-[11px] text-ink-500">
+                  {options.includeProjectMap
+                    ? "No files picked. Copy sends just the project map; pick files on the left to add their code below it."
+                    : "Pick files on the left. This shows exactly what a model would receive."}
+                </p>
               ) : building && !bundle ? (
-                <div className="flex h-full items-center justify-center py-20 text-xs text-ink-400">
+                <div className="flex items-center justify-center py-12 text-xs text-ink-400">
                   <RefreshCwIcon size={16} className="animate-spin text-ink-300 mr-2" />
                   <span>Building preview…</span>
                 </div>
               ) : bundle ? (
-                <div className="space-y-3">
-                  <div className="flex items-center justify-between text-xs text-ink-400">
-                    <span className="font-semibold text-ink-200">
-                      {formatNumber(bundle.fileCount)} files · {formatBytes(bundle.byteLen)}
-                    </span>
-                    <span className="mono text-[11px] text-ink-500">
-                      sha256 {bundle.outputHash.slice(0, 16)}…
-                    </span>
-                  </div>
-
-                  {/* Formatted Code Box */}
+                <>
                   <pre className="mono max-h-[70vh] overflow-auto rounded-lg border border-ink-800 bg-ink-950 p-4 text-[11px] leading-relaxed whitespace-pre-wrap text-ink-300 select-text">
                     {bundle.preview}
                   </pre>
-
                   {bundle.previewTruncated ? (
                     <p className="rounded-md border border-warn/30 bg-warn/10 p-2.5 text-[11px] text-warn">
-                      Preview shortened for display. The saved bundle and every number here cover
-                      all {formatNumber(bundle.fileCount)} files in full.
+                      Preview shortened for display. The copy and every number here cover all{" "}
+                      {formatNumber(bundle.fileCount)} files in full.
                     </p>
                   ) : null}
-                </div>
-              ) : null
-            ) : (
-              /* PROJECT_CONTEXT.md View */
-              <div className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h3 className="text-xs font-semibold text-ink-100">Project context index</h3>
-                    <p className="text-[11px] text-ink-400">
-                      Structure, modules, routes and dependencies — written by code, not a model.
-                      Every section links to the files it came from.
-                    </p>
-                  </div>
-                  <Button variant="primary" size="xs" onClick={store.generateContext}>
-                    {context ? "Regenerate" : "Generate"}
-                  </Button>
-                </div>
+                </>
+              ) : null}
+            </section>
 
-                {context ? (
-                  <div className="space-y-2.5">
-                    {context.document.sections.map((section: ContextSection) => (
-                      <div
-                        key={section.key}
-                        className="rounded-lg border border-ink-800 bg-ink-950/70 p-3.5"
-                      >
-                        <div className="flex items-center justify-between">
-                          <h4 className="text-xs font-semibold text-ink-200">{section.title}</h4>
-                          <Chip tone={section.freshness === "fresh" ? "ok" : "warn"} dot>
-                            {section.freshness}
-                          </Chip>
-                        </div>
-                        <pre className="mono mt-2 max-h-48 overflow-auto rounded border border-ink-800/80 bg-ink-950 p-2.5 text-[11px] text-ink-400 whitespace-pre-wrap">
-                          {section.body}
-                        </pre>
-                        {section.sourceRefs.length > 0 ? (
-                          <div className="mt-2 flex flex-wrap gap-1">
-                            {section.sourceRefs.map((ref) => (
-                              <button
-                                key={ref.path}
-                                type="button"
-                                onClick={async () => {
-                                  try {
-                                    setInspectedSource(await api.fetchSource(ref.path));
-                                  } catch (err) {
-                                    store.setError(toAppError(err));
-                                  }
-                                }}
-                                className="mono rounded border border-ink-800 bg-ink-900 px-1.5 py-0.5 text-[10px] text-ink-300 hover:border-ink-600 hover:text-ink-100 transition-colors"
-                              >
-                                {ref.path}
-                              </button>
-                            ))}
-                          </div>
-                        ) : null}
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <EmptyState
-                    title="Not generated yet"
-                    body="Build a map of this repository that a model can read instead of the whole source."
-                    action={
-                      <Button variant="primary" onClick={store.generateContext}>
-                        Generate
-                      </Button>
-                    }
-                  />
-                )}
-              </div>
-            )}
-          </div>
-        </div>
-
-        {/* PANE 3: token budget, then the controls that change it */}
-        <div className="flex flex-col overflow-y-auto space-y-2.5 rounded-lg border border-ink-800/80 bg-ink-900/60 p-2.5 shadow-2xs">
-          <TokenGauge
-            tokens={bundle?.estimate.value ?? 0}
-            label={bundle?.estimateLabel ?? "Indicative cl100k estimate"}
-            targetModel="Claude 3.5 Sonnet"
-          />
-
-          {/* Biggest contributors first: on a large repository this is the
-              panel that tells you what to drop. */}
-          {bundle && bundle.contributions.length > 0 ? (
-            <Panel title="Biggest files" description="What is using the token budget.">
-              <ul className="max-h-56 space-y-2 overflow-y-auto text-[11px]">
-                {[...bundle.contributions]
-                  .sort((a, b) => b.tokens - a.tokens)
-                  .slice(0, 10)
-                  .map((c) => (
-                    <li key={c.path}>
-                      <div className="flex justify-between gap-2">
-                        <span className="mono truncate text-ink-300">{c.path}</span>
-                        <span className="mono shrink-0 text-ink-400">
-                          {formatNumber(c.tokens)} ({((c.share ?? 0) * 100).toFixed(0)}%)
-                        </span>
-                      </div>
-                      <div className="mt-1 h-1 w-full rounded-full bg-ink-800">
-                        <div
-                          className="h-full rounded-full bg-brand"
-                          style={{ width: `${Math.max((c.share ?? 0) * 100, 2)}%` }}
-                        />
-                      </div>
+            {bundle && (bundle.skipped.length > 0 || bundle.truncations.length > 0) ? (
+              <Panel title="Warnings">
+                <ul className="space-y-1 text-[11px] text-warn">
+                  {bundle.truncations.map((t) => (
+                    <li key={t.path}>
+                      {t.path} capped to {formatBytes(t.includedBytes)}
                     </li>
                   ))}
-              </ul>
-            </Panel>
-          ) : null}
-
-          {/* What the policy already kept out, and why. */}
-          {excluded.files > 0 ? (
-            <Panel
-              title="Never bundled"
-              description={`${formatNumber(excluded.files)} files · ${formatBytes(excluded.bytes)} the policy keeps out.`}
-            >
-              <ul className="space-y-1 text-[11px]">
-                {excluded.rows.map(([fileClass, slot]) => (
-                  <li key={fileClass} className="flex items-baseline justify-between gap-2">
-                    <span className="truncate text-ink-300">{EXCLUSION_LABELS[fileClass]}</span>
-                    <span className="mono shrink-0 text-ink-500">
-                      {formatNumber(slot.files)} · {formatBytes(slot.bytes)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-              <p className="mt-2 text-[10px] leading-relaxed text-ink-500">
-                Each excluded file is still listed in the tree with its reason. Any of them can be
-                added back one at a time.
-              </p>
-            </Panel>
-          ) : null}
-
-          {/* Format is set once and then ignored, so it collapses by default. */}
-          <details className="rounded-lg border border-ink-800/80 bg-ink-900/60 shadow-2xs">
-            <summary className="cursor-pointer list-none px-4 py-2.5 text-xs font-semibold text-ink-100">
-              Output format
-              <span className="ml-1.5 font-normal text-ink-500">— what each file block looks like</span>
-            </summary>
-            <div className="space-y-1 border-t border-ink-800/60 p-4 pt-3">
-              <Toggle
-                checked={options.headers}
-                onChange={(headers) => store.setOptions({ headers })}
-                label="File path headers"
-                hint="Tells the model which file each block came from."
-              />
-              <Toggle
-                checked={options.includeTree}
-                onChange={(includeTree) => store.setOptions({ includeTree })}
-                label="Directory tree preamble"
-              />
-              <Toggle
-                checked={options.codeFences}
-                onChange={(codeFences) => store.setOptions({ codeFences })}
-                label="Code fences with language hints"
-              />
-              <Toggle
-                checked={options.lineNumbers}
-                onChange={(lineNumbers) => store.setOptions({ lineNumbers })}
-                label="Line numbers"
-                hint="Helps a model cite exact lines; costs roughly 10% more tokens."
-              />
-              <Toggle
-                checked={options.fileSizeAnnotations}
-                onChange={(fileSizeAnnotations) => store.setOptions({ fileSizeAnnotations })}
-                label="Size and token annotations"
-              />
-              <Toggle
-                checked={options.includeFrontMatter}
-                onChange={(includeFrontMatter) => store.setOptions({ includeFrontMatter })}
-                label="Embed provenance front matter"
-              />
-              <Toggle
-                checked={options.normalizeLineEndings}
-                onChange={(normalizeLineEndings) => store.setOptions({ normalizeLineEndings })}
-                label="Normalise line endings"
-                hint="Keeps output identical across Windows and macOS."
-              />
-            </div>
-          </details>
-
-          {bundle && (bundle.skipped.length > 0 || bundle.truncations.length > 0) ? (
-            <Panel title="Warnings">
-              <ul className="space-y-1 text-[11px] text-warn">
-                {bundle.truncations.map((t) => (
-                  <li key={t.path}>
-                    {t.path} capped to {formatBytes(t.includedBytes)}
-                  </li>
-                ))}
-                {bundle.skipped.map((f) => (
-                  <li key={f}>{f} could not be read and was left out</li>
-                ))}
-              </ul>
-            </Panel>
-          ) : null}
+                  {bundle.skipped.map((f) => (
+                    <li key={f}>{f} could not be read and was left out</li>
+                  ))}
+                </ul>
+              </Panel>
+            ) : null}
+          </div>
         </div>
       </div>
 
@@ -730,7 +523,7 @@ export function ContextBundlerPage() {
       {/* Preflight Export Safety Modal (ADR 0005) */}
       {preflight ? (
         <ExportPreflightDialog
-          preflight={preflight.data}
+          preflight={preflight}
           onCancel={() => setPreflight(null)}
           onConfirm={handleConfirmExport}
         />
@@ -741,6 +534,263 @@ export function ContextBundlerPage() {
         <SourceModal source={inspectedSource} onClose={() => setInspectedSource(null)} />
       ) : null}
     </div>
+  );
+}
+
+/**
+ * Shown when PROJECT_CONTEXT.md already exists in the project and LeanAI left
+ * it alone: the user decides whether LeanAI's map replaces it (ADR 0016).
+ */
+function ContextFileAlert({
+  file,
+  onReplace,
+}: {
+  file: ContextFileInfo | null;
+  onReplace: () => Promise<void>;
+}) {
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
+  const [replacing, setReplacing] = useState(false);
+  if (!file?.alert || dismissed === file.state) return null;
+
+  const title = file.canReplace
+    ? "PROJECT_CONTEXT.md already exists in this project"
+    : "LeanAI can't write PROJECT_CONTEXT.md in this project";
+  return (
+    <div role="alert" className="rounded-lg border border-warn/40 bg-warn/10 p-3 text-[11px]">
+      <p className="font-semibold text-warn">{title}</p>
+      <p className="mt-0.5 text-ink-300">{file.alert}</p>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        {!file.canReplace ? (
+          <Button size="xs" variant="ghost" onClick={() => setDismissed(file.state)}>
+            Dismiss
+          </Button>
+        ) : confirming ? (
+          <>
+            <span className="text-ink-200">
+              Replace your file with LeanAI&apos;s map? Its current content will be overwritten.
+            </span>
+            <Button
+              size="xs"
+              variant="primary"
+              disabled={replacing}
+              onClick={async () => {
+                setReplacing(true);
+                try {
+                  await onReplace();
+                } finally {
+                  setReplacing(false);
+                  setConfirming(false);
+                }
+              }}
+            >
+              {replacing ? "Replacing…" : "Yes, replace it"}
+            </Button>
+            <Button size="xs" variant="ghost" onClick={() => setConfirming(false)}>
+              Cancel
+            </Button>
+          </>
+        ) : (
+          <>
+            <Button size="xs" onClick={() => setConfirming(true)}>
+              Replace file
+            </Button>
+            <Button size="xs" variant="ghost" onClick={() => setDismissed(file.state)}>
+              Keep mine
+            </Button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Freshness in plain words. */
+const FRESHNESS_WORDS = { fresh: "Up to date", stale: "Out of date", unknown: "Can't check" };
+
+/**
+ * How big the copy is, in words anyone can act on. Tokens are how AI tools
+ * measure text; the thresholds follow common chat limits and are guidance,
+ * not a promise about any one AI.
+ */
+function sizeGuide(tokens: number): { word: string; tone: string; advice: string } {
+  if (tokens <= 30_000) {
+    return { word: "Small", tone: "text-ok", advice: "fits in almost any AI chat." };
+  }
+  if (tokens <= 120_000) {
+    return {
+      word: "Medium",
+      tone: "text-ink-200",
+      advice: "fits in most AI chats; some free plans may cut it off.",
+    };
+  }
+  return {
+    word: "Large",
+    tone: "text-warn",
+    advice: "too big for many AI chats. Pick fewer files.",
+  };
+}
+
+/** 96217 → "96k", 1234567 → "1.2M". */
+function shortNumber(value: number): string {
+  if (value < 1_000) return String(value);
+  if (value < 1_000_000) return `${Math.round(value / 1_000)}k`;
+  return `${(value / 1_000_000).toFixed(1)}M`;
+}
+
+/** Overall freshness of the map: stale if any section is, unknown if any is. */
+function mapFreshness(document: ContextDocument): "fresh" | "stale" | "unknown" {
+  if (document.sections.some((section) => section.freshness === "stale")) return "stale";
+  if (document.sections.some((section) => section.freshness === "unknown")) return "unknown";
+  return "fresh";
+}
+
+/**
+ * The project map (PROJECT_CONTEXT.md) as readable sections, with each
+ * section's sources and limits one click away. It heads the copied text when
+ * included.
+ */
+function ProjectMapCard({
+  included,
+  document,
+  onRegenerate,
+  onInclude,
+  onOpenSource,
+}: {
+  included: boolean;
+  document: ContextDocument | null;
+  onRegenerate: () => Promise<void>;
+  onInclude: (include: boolean) => void;
+  onOpenSource: (path: string) => Promise<void>;
+}) {
+  const [regenerating, setRegenerating] = useState(false);
+  const [open, setOpen] = useState(true);
+  const regenerate = async () => {
+    setRegenerating(true);
+    try {
+      await onRegenerate();
+    } finally {
+      setRegenerating(false);
+    }
+  };
+
+  if (!included) {
+    return (
+      <div className="flex items-center justify-between gap-3 rounded-lg border border-dashed border-ink-800 px-3.5 py-2.5 text-[11px] text-ink-500">
+        <span>
+          The project map is off, so the AI gets only your files, without a summary of the project.
+        </span>
+        <Button size="xs" onClick={() => onInclude(true)}>
+          Include it
+        </Button>
+      </div>
+    );
+  }
+
+  if (!document) {
+    return (
+      <div className="flex items-center justify-center rounded-lg border border-ink-800 py-8 text-xs text-ink-400">
+        <RefreshCwIcon size={14} className="mr-2 animate-spin text-ink-300" />
+        Making the project map…
+      </div>
+    );
+  }
+
+  const freshness = mapFreshness(document);
+  return (
+    <section aria-label="Project map" className="rounded-lg border border-ink-800 bg-ink-950/70">
+      <div className="flex items-center justify-between gap-2 px-3.5 py-2.5">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+          className="flex min-w-0 items-center gap-2 text-left"
+        >
+          <span aria-hidden className="text-[10px] text-ink-500">
+            {open ? "▾" : "▸"}
+          </span>
+          <span className="text-xs font-semibold text-ink-100">Project map</span>
+          <Chip
+            tone={freshness === "fresh" ? "ok" : freshness === "stale" ? "warn" : "neutral"}
+            dot
+          >
+            {FRESHNESS_WORDS[freshness]}
+          </Chip>
+        </button>
+        <div className="flex shrink-0 items-center gap-3">
+          <label className="flex cursor-pointer items-center gap-1.5 text-[11px] text-ink-300">
+            <input
+              type="checkbox"
+              checked
+              aria-label="Include project map"
+              onChange={() => onInclude(false)}
+              className="size-3.5 rounded accent-ink-100"
+            />
+            Include
+          </label>
+          <Button
+            size="xs"
+            disabled={regenerating}
+            onClick={() => void regenerate()}
+            title="Make the map again from the current files"
+          >
+            <RefreshCwIcon size={11} className={regenerating ? "animate-spin" : ""} />
+            <span>{regenerating ? "Refreshing…" : "Refresh"}</span>
+          </Button>
+        </div>
+      </div>
+
+      {open ? (
+        <div className="space-y-3 border-t border-ink-800 px-3.5 py-3">
+          <p className="text-[11px] text-ink-500">
+            A short summary of your project. The AI reads it first, before your files. It is also
+            saved in your project as <span className="mono">PROJECT_CONTEXT.md</span>.
+          </p>
+          {freshness === "stale" ? (
+            <p className="rounded-md border border-warn/30 bg-warn/10 p-2 text-[11px] text-warn">
+              Some files changed since this map was made. Press Refresh to update it.
+            </p>
+          ) : null}
+          {document.sections.map((section: ContextSection) => (
+            <section key={section.key} aria-label={section.title} className="space-y-1.5">
+              <h4 className="flex items-center gap-2 text-xs font-semibold text-ink-200">
+                {section.title}
+                {section.freshness === "stale" ? <Chip tone="warn">Out of date</Chip> : null}
+              </h4>
+              <MiniMarkdown text={section.body} />
+              {section.sourceRefs.length > 0 || section.limitations.length > 0 ? (
+                <details className="text-[10px] text-ink-500">
+                  <summary className="cursor-pointer hover:text-ink-300">
+                    Sources and limits
+                  </summary>
+                  {section.limitations.length > 0 ? (
+                    <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                      {section.limitations.map((limitation) => (
+                        <li key={limitation}>{limitation}</li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {section.sourceRefs.length > 0 ? (
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {section.sourceRefs.map((ref) => (
+                        <button
+                          key={ref.path}
+                          type="button"
+                          onClick={() => void onOpenSource(ref.path)}
+                          className="mono rounded border border-ink-800 bg-ink-900 px-1.5 py-0.5 text-[10px] text-ink-300 hover:border-ink-600 hover:text-ink-100 transition-colors"
+                        >
+                          {ref.path}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </details>
+              ) : null}
+            </section>
+          ))}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -827,12 +877,18 @@ function ExportPreflightDialog({
           Export Safety Preflight
         </h2>
         <p className="mt-1 text-xs text-ink-400">{preflight.destinationNote}</p>
+        {preflight.projectMapIncluded ? (
+          <p className="mt-1 text-xs text-ink-400">
+            The project map (PROJECT_CONTEXT.md) goes first, above the files. It is scanned too.
+          </p>
+        ) : null}
 
         <div className="mt-4 grid grid-cols-3 gap-3">
           <div className="rounded-lg border border-ink-800 bg-ink-950 p-2.5">
             <span className="text-[10px] text-ink-500">Files</span>
             <p className="mt-0.5 text-sm font-semibold text-ink-100">
               {formatNumber(preflight.fileCount)}
+              {preflight.projectMapIncluded ? " + map" : ""}
             </p>
           </div>
           <div className="rounded-lg border border-ink-800 bg-ink-950 p-2.5">

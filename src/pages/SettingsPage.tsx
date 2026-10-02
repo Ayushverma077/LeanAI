@@ -92,7 +92,9 @@ export function SettingsPage() {
         <div className="space-y-3">
           <Toggle
             checked={draft.policy.respectGitIgnore}
-            onChange={(respectGitIgnore) => update({ policy: { ...draft.policy, respectGitIgnore } })}
+            onChange={(respectGitIgnore) =>
+              update({ policy: { ...draft.policy, respectGitIgnore } })
+            }
             label="Respect git excludes (.gitignore, global excludes)"
           />
           <Toggle
@@ -102,12 +104,16 @@ export function SettingsPage() {
           />
           <Toggle
             checked={draft.policy.excludeLockfiles}
-            onChange={(excludeLockfiles) => update({ policy: { ...draft.policy, excludeLockfiles } })}
+            onChange={(excludeLockfiles) =>
+              update({ policy: { ...draft.policy, excludeLockfiles } })
+            }
             label="Exclude dependency lockfiles"
           />
           <Toggle
             checked={draft.policy.excludeGenerated}
-            onChange={(excludeGenerated) => update({ policy: { ...draft.policy, excludeGenerated } })}
+            onChange={(excludeGenerated) =>
+              update({ policy: { ...draft.policy, excludeGenerated } })
+            }
             label="Exclude generated and minified output"
           />
           <Toggle
@@ -309,7 +315,9 @@ export function SettingsPage() {
               <li key={capability}>{capability}</li>
             ))}
           </ul>
-          <p className="mt-3 rounded bg-ink-950 p-2 text-[11px] text-ink-500">{diagnostics.notice}</p>
+          <p className="mt-3 rounded bg-ink-950 p-2 text-[11px] text-ink-500">
+            {diagnostics.notice}
+          </p>
         </Panel>
       ) : null}
     </div>

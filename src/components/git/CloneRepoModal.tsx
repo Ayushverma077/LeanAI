@@ -12,7 +12,10 @@ import {
   SearchIcon,
   StarIcon,
 } from "../icons";
-import type { GitHubRepository } from "../../ipc/types";
+import { api, onCloneProgress } from "../../ipc/client";
+import type { CloneProgress, GitHubRepository } from "../../ipc/types";
+import { CloneProgressView } from "./CloneProgressView";
+import { isGitHubHttpsUrl } from "./gitUrl";
 
 const LANGUAGE_COLORS: Record<string, string> = {
   TypeScript: "bg-blue-400",
@@ -60,6 +63,17 @@ export function CloneRepoModal({ open: isOpen, onClose, initialRepo }: CloneRepo
   const [directoryName, setDirectoryName] = useState("");
   const [cloning, setCloning] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [fullHistory, setFullHistory] = useState(false);
+  const [progress, setProgress] = useState<CloneProgress | null>(null);
+
+  // Live progress while a clone runs, streamed from git by the backend.
+  useEffect(() => {
+    if (!cloning) return;
+    const unlisten = onCloneProgress(setProgress);
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, [cloning]);
 
   // Sync tab and initial selection when opened
   useEffect(() => {
@@ -146,22 +160,34 @@ export function CloneRepoModal({ open: isOpen, onClose, initialRepo }: CloneRepo
 
     setCloning(true);
     setErrorMsg(null);
+    setProgress(null);
     try {
       await cloneRepository({
         url: url.trim(),
         destinationParentDir: destinationParentDir.trim(),
         directoryName: directoryName.trim() || undefined,
+        fullHistory,
       });
       onClose();
     } catch (e: unknown) {
+      const error =
+        typeof e === "object" && e !== null
+          ? (e as { code?: unknown; message?: unknown; recovery?: unknown })
+          : {};
+      // Stopping a clone is a choice, not a failure.
+      if (error.code === "clone_cancelled") return;
       const msg =
-        typeof e === "object" && e && "message" in e
-          ? String((e as { message: string }).message)
-          : "Failed to clone repository.";
-      setErrorMsg(msg);
+        typeof error.message === "string" ? error.message.trim() : "Failed to clone repository.";
+      // The backend says *why* and what to do next; git's stderr alone does not.
+      const recovery = typeof error.recovery === "string" ? error.recovery : null;
+      setErrorMsg(recovery ? `${msg}\n\n${recovery}` : msg);
     } finally {
       setCloning(false);
     }
+  };
+
+  const handleStopClone = async () => {
+    await api.cancelClone().catch(() => undefined);
   };
 
   const isSsh = url.startsWith("git@") || url.startsWith("ssh://");
@@ -170,7 +196,9 @@ export function CloneRepoModal({ open: isOpen, onClose, initialRepo }: CloneRepo
   return (
     <Modal
       open={isOpen}
-      onClose={onClose}
+      // While cloning, only "Stop clone" ends it: dismissing the dialog would
+      // hide the progress of a download that is still running.
+      onClose={cloning ? () => undefined : onClose}
       title="Clone Remote Repository"
       description="Clone a Git repository from GitHub or any remote host and open it in LeanAI Desktop."
       className="max-w-2xl"
@@ -409,12 +437,18 @@ export function CloneRepoModal({ open: isOpen, onClose, initialRepo }: CloneRepo
               <span className="mono text-[11px] text-ink-200 truncate">{url}</span>
             </div>
             <div className="shrink-0 pl-2">
+              {/* Says what will actually be sent. The token only ever goes to
+                  https://github.com, and a rejected one falls back to anonymous. */}
               <span className="text-[10px] text-ink-400">
                 {isSsh
-                  ? "Local SSH Key"
-                  : isGitHubConfigured
-                    ? "Authenticated PAT"
-                    : "Public Helper"}
+                  ? "Local SSH key"
+                  : !url.trim().startsWith("https://")
+                    ? "Unencrypted \u2014 no token sent"
+                    : !isGitHubHttpsUrl(url)
+                      ? "Token not sent to this host"
+                      : isGitHubConfigured
+                        ? "GitHub token"
+                        : "Anonymous"}
               </span>
             </div>
           </div>
@@ -450,6 +484,28 @@ export function CloneRepoModal({ open: isOpen, onClose, initialRepo }: CloneRepo
           />
         </Field>
 
+        {/* Shallow by default: LeanAI bundles current files, and the latest
+            snapshot of a large repository is a fraction of its history. */}
+        <label className="flex items-start gap-2 text-xs text-ink-300">
+          <input
+            type="checkbox"
+            checked={fullHistory}
+            onChange={(e) => setFullHistory(e.target.checked)}
+            disabled={cloning}
+            className="mt-0.5 size-3.5 accent-brand"
+          />
+          <span>
+            Full history
+            <span className="block text-[11px] text-ink-500">
+              Off downloads only the latest snapshot, which is much faster for large repositories.
+              Turn on if you need <span className="mono">git log</span> or diffs against older
+              commits.
+            </span>
+          </span>
+        </label>
+
+        {cloning && <CloneProgressView progress={progress} />}
+
         {errorMsg && (
           <div className="rounded border border-red-500/30 bg-red-500/10 p-2.5 text-xs text-red-400 font-mono whitespace-pre-wrap">
             {errorMsg}
@@ -458,8 +514,11 @@ export function CloneRepoModal({ open: isOpen, onClose, initialRepo }: CloneRepo
 
         {/* Actions */}
         <div className="flex items-center justify-between pt-2 border-t border-ink-800/80">
-          <Button variant="ghost" onClick={onClose} disabled={cloning}>
-            Cancel
+          <Button
+            variant={cloning ? "danger" : "ghost"}
+            onClick={cloning ? () => void handleStopClone() : onClose}
+          >
+            {cloning ? "Stop clone" : "Cancel"}
           </Button>
           <Button
             variant="primary"
@@ -468,7 +527,7 @@ export function CloneRepoModal({ open: isOpen, onClose, initialRepo }: CloneRepo
             className="flex items-center gap-1.5"
           >
             <DownloadCloudIcon size={14} />
-            <span>{cloning ? "Cloning Repository…" : "Clone & Open"}</span>
+            <span>{cloning ? "Cloning…" : "Clone & Open"}</span>
           </Button>
         </div>
       </div>

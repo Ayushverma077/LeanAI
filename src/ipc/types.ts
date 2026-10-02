@@ -92,6 +92,8 @@ export interface BundleOptions {
   includeFrontMatter: boolean;
   normalizeLineEndings: boolean;
   maxFileBytes: number | null;
+  /** Put PROJECT_CONTEXT.md (the project map) above the files. */
+  includeProjectMap: boolean;
 }
 
 export interface SelectionSpec {
@@ -172,8 +174,15 @@ export interface BundleManifest {
 
 export interface BuildBundleResponse {
   resolved: ResolvedSelection;
+  /** Bundle text without the project map, which is shown on its own. */
   preview: string;
   previewTruncated: boolean;
+  /** Tokens the project map adds; 0 when it is not included. */
+  projectMapTokens: number;
+  /** The exact map that heads the bundle, when included. */
+  projectMap: ContextDocument | null;
+  /** State of PROJECT_CONTEXT.md in the project, when the map is included. */
+  projectMapFile: ContextFileInfo | null;
   outputHash: string;
   estimate: TokenEstimate;
   estimateLabel: string;
@@ -208,6 +217,7 @@ export type ExportDestination = "clipboard" | "file";
 
 export interface ExportPreflight {
   fileCount: number;
+  projectMapIncluded: boolean;
   byteLen: number;
   estimate: TokenEstimate;
   estimateLabel: string;
@@ -255,6 +265,12 @@ export interface OpenProjectResponse {
   project: ProjectRecord;
   git: GitState;
   hasAiIgnore: boolean;
+}
+
+/** `clone_remote_repository`: the opened project, plus any note about auth. */
+export interface CloneRepositoryResponse extends OpenProjectResponse {
+  /** Set when the clone only succeeded after dropping a rejected GitHub token. */
+  authNotice: string | null;
 }
 
 export interface ScanResponse {
@@ -327,6 +343,8 @@ export interface ContextSection {
 export interface ContextDocument {
   schemaVersion: number;
   projectFingerprint: string;
+  /** Project directory name; the document title. */
+  projectName?: string;
   sourceRevision: string;
   generatedAtMs: number;
   contentHash: string;
@@ -338,6 +356,20 @@ export interface ContextResponse {
   markdown: string;
   freshness: Freshness;
   staleSectionKeys: string[];
+  /** State of PROJECT_CONTEXT.md in the project folder. */
+  file: ContextFileInfo;
+}
+
+/** PROJECT_CONTEXT.md in the project, compared with what LeanAI last wrote. */
+export type ContextFileState =
+  "missing" | "current" | "edited" | "foreign" | "tracked_by_git" | "not_a_file" | "unreadable";
+
+export interface ContextFileInfo {
+  state: ContextFileState;
+  /** Set when LeanAI left an existing file alone. */
+  alert: string | null;
+  /** Whether the user may replace the file with LeanAI's map. */
+  canReplace: boolean;
 }
 
 export interface ChangeImpact {
@@ -583,20 +615,22 @@ export interface ValidatorVerdict {
   blockerSummary?: string;
 }
 
-export type DecisionState = "pending" | "approved" | "denied" | "timed_out";
+export type DecisionState = "pending" | "approved" | "denied" | "expired";
 
+/** Mirrors `leanai_core::approval::ApprovalRequest`. */
 export interface ApprovalRequest {
-  approvalId: string;
+  id: string;
   runId: string;
-  requestedCapability: ToolCapability;
+  capability: string;
   projectRoot: string;
-  targetPaths: string[];
-  diffHash: string;
+  affectedPaths: string[];
+  patchHash: string;
+  token: string;
+  createdAtMs: number;
+  expiresAtMs: number;
   state: DecisionState;
-  approver?: string;
-  requestedAtMs: number;
-  decidedAtMs?: number;
-  ttlMs: number;
+  approver?: string | null;
+  decidedAtMs?: number | null;
 }
 
 export interface StepRecord {
@@ -662,6 +696,188 @@ export interface ResolveApprovalResponse {
   patchApplied: boolean;
   rollbackPerformed: boolean;
   message: string;
+  contextRefreshed: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Prompt routing (`run_prompt`). Mirrors `leanai_core::routing` and
+// `src-tauri/src/commands/prompt.rs`.
+// ---------------------------------------------------------------------------
+
+export type PromptIntent =
+  | "CODE_EDIT"
+  | "BUG_FIX"
+  | "REFACTOR"
+  | "EXPLANATION"
+  | "CREATIVE_WRITING"
+  | "GENERAL_QA"
+  | "RESEARCH"
+  | "SUMMARIZATION"
+  | "ARCHITECTURE"
+  | "OTHER";
+
+export type ModelTier = "fast" | "balanced" | "powerful";
+export type ContextLevel = "none" | "minimal" | "sections" | "broad";
+
+export interface ModelStrengths {
+  coding: number;
+  reasoning: number;
+  creativity: number;
+  longContext: number;
+  instructionFollowing: number;
+}
+
+export interface PromptSignals {
+  reasoningDifficulty: number;
+  scope: number;
+  repositoryDependency: number;
+  domainDifficulty: number;
+  risk: number;
+  crossFileDependency: number;
+  architectureDependency: number;
+  projectKnowledge: number;
+  operationCount: number;
+  layers: string[];
+  codeArtifacts: string[];
+  projectTerms: string[];
+}
+
+export interface PromptAnalysis {
+  intent: PromptIntent;
+  /** 0-1: how concentrated the intent evidence is (heuristic, not calibrated). */
+  intentConfidence: number;
+  /** 0-1: share of the intent evidence that points at changing code. */
+  changeShare: number;
+  complexity: number;
+  contextRequirement: number;
+  signals: PromptSignals;
+  required: ModelStrengths;
+  requiredCapabilities: string[];
+  explanation: string[];
+}
+
+export interface ContextBudget {
+  level: ContextLevel;
+  sections: string[];
+  initialContextTokens: number;
+  maxRetrievedTokens: number;
+  maxFileTokens: number;
+  maxRounds: number;
+  maxOutputTokens: number;
+  allowRetrieval: boolean;
+}
+
+export interface ModelSelection {
+  modelId: string;
+  displayName: string;
+  provider: string;
+  apiModel: string;
+  tier: ModelTier;
+  minimumTier: ModelTier;
+  estimatedCostUsd: number;
+  escalationChain: string[];
+  capabilityShortfall: string[];
+  explanation: string;
+}
+
+export interface PromptRetrieval {
+  path: string;
+  fromLine: number;
+  toLine: number;
+  tokens: number;
+  refused: string | null;
+  redactedLines: number;
+}
+
+export interface PromptTraceStep {
+  kind: string;
+  detail: string;
+  tokens: number;
+  modelId: string | null;
+}
+
+export interface PromptTokenMetrics {
+  repositoryTokensEstimate: number;
+  initialContextTokens: number;
+  retrievedTokens: number;
+  contextTokensSent: number;
+  tokensAvoided: number;
+  billedInputTokens: number;
+  billedOutputTokens: number;
+  llmCalls: number;
+  estimatedCostUsd: number;
+}
+
+/** A user-hosted model behind an OpenAI-compatible API. */
+export interface SelfHostedModel {
+  id: string;
+  displayName: string;
+  baseUrl: string;
+  model: string;
+  tier: ModelTier;
+  contextCap: number;
+  hasApiKey: boolean;
+}
+
+export interface SaveSelfHostedModelRequest {
+  id?: string;
+  displayName: string;
+  baseUrl: string;
+  model: string;
+  tier: ModelTier;
+  contextCap?: number;
+  apiKey?: string;
+  clearApiKey?: boolean;
+}
+
+export interface SelfHostedTestResult {
+  latencyMs: number;
+  reply: string;
+}
+
+export interface RunPromptRequest {
+  prompt: string;
+  history?: { role: "user" | "assistant"; content: string }[];
+  autoApply?: boolean;
+  requireLocalOnly?: boolean;
+}
+
+/** How much review a proposed change gets (ADR 0013), least to most. */
+export type ApplyLevel = "auto_apply" | "confirm" | "careful_review";
+
+export interface ApplyGateReason {
+  level: ApplyLevel;
+  text: string;
+}
+
+export interface ApplyDecision {
+  level: ApplyLevel;
+  /** Most serious first; empty when nothing but the setting held a change back. */
+  reasons: ApplyGateReason[];
+}
+
+export interface PromptRunResponse {
+  runId: string;
+  status: "completed" | "awaiting_approval" | "applied";
+  answer: string | null;
+  summary: string | null;
+  analysis: PromptAnalysis;
+  budget: ContextBudget;
+  selection: ModelSelection;
+  finalModelId: string;
+  finalModelName: string;
+  escalations: { fromModelId: string; toModelId: string; reason: string }[];
+  retrievals: PromptRetrieval[];
+  searches: string[];
+  patchProposal: PatchProposal | null;
+  validatorVerdict: unknown;
+  applyDecision: ApplyDecision | null;
+  pendingApproval: ApprovalRequest | null;
+  filesChanged: string[];
+  contextRefreshed: boolean;
+  metrics: PromptTokenMetrics;
+  trace: PromptTraceStep[];
+  warnings: string[];
 }
 
 export interface RunRecord {
@@ -807,4 +1023,21 @@ export interface CloneRepositoryRequest {
   url: string;
   destinationParentDir: string;
   directoryName?: string;
+  /** Download complete history. Off (the default) takes only the latest snapshot. */
+  fullHistory?: boolean;
 }
+
+/** One progress update from `git clone --progress`. */
+export interface CloneProgress {
+  /** e.g. "Receiving objects", "Resolving deltas", "Updating files". */
+  phase: string;
+  percent: number;
+  current: number;
+  total: number;
+  /** Amount received so far, as git formats it ("45.67 MiB"). */
+  transferred: string | null;
+  /** Throughput, as git formats it ("2.31 MiB/s"). */
+  speed: string | null;
+}
+
+export const CLONE_PROGRESS_EVENT = "leanai://clone-progress";

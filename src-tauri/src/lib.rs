@@ -10,6 +10,7 @@ pub mod commands;
 pub mod db;
 pub mod error;
 pub mod keychain;
+pub mod llm_client;
 pub mod sidecar_manager;
 
 #[cfg(target_os = "macos")]
@@ -134,7 +135,6 @@ pub fn run() {
             commands::context::load_context,
             commands::context::context_change_impact,
             commands::context::fetch_source,
-            commands::context::save_context_document,
             commands::settings::get_settings,
             commands::settings::update_settings,
             commands::settings::describe_policy,
@@ -153,6 +153,10 @@ pub fn run() {
             commands::models::get_model_catalog,
             commands::models::route_task,
             commands::models::estimate_provider_tokens,
+            commands::models::list_self_hosted_models,
+            commands::models::save_self_hosted_model,
+            commands::models::delete_self_hosted_model,
+            commands::models::test_self_hosted_model,
             commands::agent::start_task_run,
             commands::agent::resolve_approval,
             commands::agent::cancel_task_run,
@@ -162,6 +166,7 @@ pub fn run() {
             commands::agent::get_command_allowlist_command,
             commands::agent::update_command_allowlist_command,
             commands::agent::run_tester_step,
+            commands::prompt::run_prompt,
             commands::git::get_git_auth_status,
             commands::git::configure_github_token,
             commands::git::disconnect_github,
@@ -169,8 +174,18 @@ pub fn run() {
             commands::git::git_remote_status,
             commands::git::git_push_branch,
             commands::git::clone_remote_repository,
+            commands::git::cancel_clone,
             commands::git::list_github_repositories,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running LeanAI Desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building LeanAI Desktop")
+        .run(|app, event| {
+            // A clone in progress must not outlive the app, or it keeps
+            // downloading in the background with nothing left to report to.
+            if let tauri::RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<AppState>() {
+                    state.cancel_clone();
+                }
+            }
+        });
 }

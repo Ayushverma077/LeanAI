@@ -1,8 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
   AiIgnoreFile,
+  CloneProgress,
+  CloneRepositoryResponse,
   DirectorySummary,
   SelectionRecipe,
   SuggestedSelection,
@@ -48,6 +50,12 @@ import type {
   RetrievalResult,
   TesterArtifact,
   RunTesterRequest,
+  RunPromptRequest,
+  PromptRunResponse,
+  PromptTraceStep,
+  SelfHostedModel,
+  SaveSelfHostedModelRequest,
+  SelfHostedTestResult,
   GitAuthStatus,
   SshAuthTestResult,
   GitRemoteStatus,
@@ -56,7 +64,7 @@ import type {
   CloneRepositoryRequest,
   GitHubRepository,
 } from "./types";
-import { SCAN_PROGRESS_EVENT } from "./types";
+import { CLONE_PROGRESS_EVENT, SCAN_PROGRESS_EVENT } from "./types";
 
 /** Every command the backend exposes. Kept in sync by `contract.test.ts`. */
 export const COMMANDS = [
@@ -89,7 +97,6 @@ export const COMMANDS = [
   "load_context",
   "context_change_impact",
   "fetch_source",
-  "save_context_document",
   "get_settings",
   "update_settings",
   "describe_policy",
@@ -108,6 +115,10 @@ export const COMMANDS = [
   "get_model_catalog",
   "route_task",
   "estimate_provider_tokens",
+  "list_self_hosted_models",
+  "save_self_hosted_model",
+  "delete_self_hosted_model",
+  "test_self_hosted_model",
   "start_task_run",
   "resolve_approval",
   "cancel_task_run",
@@ -117,6 +128,7 @@ export const COMMANDS = [
   "get_command_allowlist_command",
   "update_command_allowlist_command",
   "run_tester_step",
+  "run_prompt",
   "get_git_auth_status",
   "configure_github_token",
   "disconnect_github",
@@ -124,6 +136,7 @@ export const COMMANDS = [
   "git_remote_status",
   "git_push_branch",
   "clone_remote_repository",
+  "cancel_clone",
   "list_github_repositories",
 ] as const;
 
@@ -218,7 +231,9 @@ export const api = {
   clearBundleHistory: () => call<number>("clear_bundle_history"),
   auditLog: () => call<AuditEntry[]>("audit_log"),
 
-  generateContext: () => call<ContextResponse>("generate_context"),
+  /** `replaceExisting`: the user chose to replace a PROJECT_CONTEXT.md LeanAI did not write. */
+  generateContext: (replaceExisting = false) =>
+    call<ContextResponse>("generate_context", { request: { replaceExisting } }),
   loadContext: () => call<ContextResponse | null>("load_context"),
   contextChangeImpact: () =>
     call<{ impact: ChangeImpact; freshness: string } | null>("context_change_impact"),
@@ -226,8 +241,6 @@ export const api = {
     call<SourceOnDemandResponse>("fetch_source", {
       request: { path, fromLine: fromLine ?? null, toLine: toLine ?? null },
     }),
-  saveContextDocument: (targetPath: string) =>
-    call<string>("save_context_document", { request: { targetPath } }),
 
   getSettings: () => call<Settings>("get_settings"),
   updateSettings: (settings: Settings) => call<Settings>("update_settings", { settings }),
@@ -297,6 +310,18 @@ export const api = {
     call<void>("update_command_allowlist_command", { request: { commands } }),
   runTesterStep: (request: RunTesterRequest) =>
     call<TesterArtifact>("run_tester_step", { request }),
+  listSelfHostedModels: () => call<SelfHostedModel[]>("list_self_hosted_models"),
+  saveSelfHostedModel: (request: SaveSelfHostedModelRequest) =>
+    call<SelfHostedModel>("save_self_hosted_model", { request }),
+  deleteSelfHostedModel: (id: string) =>
+    call<boolean>("delete_self_hosted_model", { request: { id } }),
+  testSelfHostedModel: (id: string) =>
+    call<SelfHostedTestResult>("test_self_hosted_model", { request: { id } }),
+  runPrompt: (request: RunPromptRequest, onProgress?: (step: PromptTraceStep) => void) => {
+    const channel = new Channel<PromptTraceStep>();
+    if (onProgress) channel.onmessage = onProgress;
+    return call<PromptRunResponse>("run_prompt", { request, onProgress: channel });
+  },
   getGitAuthStatus: () => call<GitAuthStatus>("get_git_auth_status"),
   configureGithubToken: (token: string, accountLabel?: string) =>
     call<GitAuthStatus>("configure_github_token", {
@@ -308,7 +333,8 @@ export const api = {
   gitPushBranch: (request: GitPushRequest = {}) =>
     call<GitPushResponse>("git_push_branch", { request }),
   cloneRemoteRepository: (request: CloneRepositoryRequest) =>
-    call<OpenProjectResponse>("clone_remote_repository", { request }),
+    call<CloneRepositoryResponse>("clone_remote_repository", { request }),
+  cancelClone: () => call<boolean>("cancel_clone"),
   listGithubRepositories: () => call<GitHubRepository[]>("list_github_repositories"),
 };
 
@@ -317,4 +343,9 @@ type ResolvedSelectionResponse = import("./types").ResolvedSelection;
 /** Subscribes to scan progress. Returns an unsubscribe function. */
 export function onScanProgress(handler: (progress: ScanProgress) => void): Promise<UnlistenFn> {
   return listen<ScanProgress>(SCAN_PROGRESS_EVENT, (event) => handler(event.payload));
+}
+
+/** Subscribes to clone progress. Returns an unsubscribe function. */
+export function onCloneProgress(handler: (progress: CloneProgress) => void): Promise<UnlistenFn> {
+  return listen<CloneProgress>(CLONE_PROGRESS_EVENT, (event) => handler(event.payload));
 }

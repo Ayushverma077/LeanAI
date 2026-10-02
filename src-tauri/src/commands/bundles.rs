@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 
 use leanai_core::concat::{self, Bundle, BundleOptions};
+use leanai_core::context::{self, ContextDocument};
 use leanai_core::manifest::BundleManifest;
 use leanai_core::project;
 use leanai_core::secrets::{self, SecretReport};
@@ -12,8 +13,32 @@ use leanai_core::selection::{
 use leanai_core::tokenizer;
 
 use crate::app_state::AppState;
+use crate::commands::context::{ensure_project_context, file_info, ContextFileInfo};
 use crate::db::repositories;
 use crate::error::{AppError, AppResult};
+
+/// The project map for a bundle that asks for one: the stored index,
+/// regenerated first when it is missing, stale or in an older format, so the
+/// map always matches the files beside it (ADR 0015).
+async fn project_map(
+    state: &AppState,
+    options: &BundleOptions,
+) -> AppResult<Option<(ContextDocument, String)>> {
+    if !options.include_project_map {
+        return Ok(None);
+    }
+    let document = ensure_project_context(state).await?;
+    let markdown = context::render(&document);
+    Ok(Some((document, markdown)))
+}
+
+/// The state of PROJECT_CONTEXT.md in the project, for the map shown beside
+/// the bundle.
+fn map_file(state: &AppState, document: &ContextDocument) -> Option<ContextFileInfo> {
+    state
+        .session()
+        .map(|session| file_info(&session.root, document))
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -104,13 +129,22 @@ pub struct BuildBundleResponse {
     #[serde(flatten)]
     pub bundle: BundlePreview,
     pub manifest: BundleManifest,
+    /// The exact index whose rendering heads the bundle, when included, so the
+    /// UI shows the same map that is copied.
+    pub project_map: Option<ContextDocument>,
+    /// The state of PROJECT_CONTEXT.md in the project, when the map is
+    /// included, so the page can alert about an existing file.
+    pub project_map_file: Option<ContextFileInfo>,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BundlePreview {
+    /// The bundle text without the project map, which the UI shows on its own.
     pub preview: String,
     pub preview_truncated: bool,
+    /// Tokens the project map adds; 0 when it is not included.
+    pub project_map_tokens: usize,
     pub output_hash: String,
     pub estimate: tokenizer::TokenEstimate,
     /// The label the UI must render next to the number.
@@ -132,8 +166,11 @@ const PREVIEW_LIMIT: usize = 64_000;
 
 fn preview_of(bundle: Bundle, limit: Option<usize>) -> BundlePreview {
     let limit = limit.unwrap_or(PREVIEW_LIMIT);
-    let truncated = bundle.text.len() > limit;
     let mut preview = bundle.text;
+    if let Some((start, end)) = bundle.project_map_range {
+        preview.replace_range(start..end, "");
+    }
+    let truncated = preview.len() > limit;
     if truncated {
         let mut end = limit;
         while end > 0 && !preview.is_char_boundary(end) {
@@ -144,6 +181,7 @@ fn preview_of(bundle: Bundle, limit: Option<usize>) -> BundlePreview {
     BundlePreview {
         preview,
         preview_truncated: truncated,
+        project_map_tokens: bundle.project_map_tokens,
         output_hash: bundle.output_hash,
         estimate_label: bundle.estimate.kind.label(),
         estimate: bundle.estimate,
@@ -162,6 +200,8 @@ pub async fn build_bundle(
     state: State<'_, AppState>,
     request: BuildBundleRequest,
 ) -> AppResult<BuildBundleResponse> {
+    // First, because regenerating the map may rescan the project.
+    let map = project_map(&state, &request.options).await?;
     let session = state.require_session()?;
     let policy = state.settings().policy;
     let inventory = session.inventory.clone();
@@ -171,9 +211,19 @@ pub async fn build_bundle(
     let options = request.options.clone();
     let build_inventory = inventory.clone();
     let build_resolved = resolved.clone();
+    let (map_document, map_text) = map.unzip();
+    let project_map_file = map_document
+        .as_ref()
+        .and_then(|document| map_file(&state, document));
 
     let bundle = tauri::async_runtime::spawn_blocking(move || {
-        concat::build(&root, &build_inventory, &build_resolved, &options)
+        concat::build_with_map(
+            &root,
+            &build_inventory,
+            &build_resolved,
+            &options,
+            map_text.as_deref(),
+        )
     })
     .await
     .map_err(|error| AppError::internal(format!("bundle task failed: {error}")))??;
@@ -191,6 +241,8 @@ pub async fn build_bundle(
         resolved,
         bundle: preview_of(bundle, request.preview_limit),
         manifest,
+        project_map: map_document,
+        project_map_file,
     })
 }
 
@@ -218,6 +270,8 @@ pub enum ExportDestination {
 #[serde(rename_all = "camelCase")]
 pub struct ExportPreflight {
     pub file_count: usize,
+    /// True when `PROJECT_CONTEXT.md` heads the exported text.
+    pub project_map_included: bool,
     pub byte_len: u64,
     pub estimate: tokenizer::TokenEstimate,
     pub estimate_label: String,
@@ -235,6 +289,9 @@ pub async fn export_preflight(
     state: State<'_, AppState>,
     request: ExportRequest,
 ) -> AppResult<ExportPreflight> {
+    let map_text = project_map(&state, &request.options)
+        .await?
+        .map(|(_, markdown)| markdown);
     let session = state.require_session()?;
     let settings = state.settings();
     let resolved = selection::resolve(&session.inventory, &request.selection, &settings.policy)?;
@@ -244,8 +301,13 @@ pub async fn export_preflight(
     let files = resolved.files.clone();
 
     let (bundle, report) = tauri::async_runtime::spawn_blocking(move || {
-        let bundle = concat::build(&root, &inventory, &resolved, &options)?;
+        let bundle =
+            concat::build_with_map(&root, &inventory, &resolved, &options, map_text.as_deref())?;
         let mut report = SecretReport::default();
+        // The map is generated text, but it leaves too, so it is scanned too.
+        if let Some(map) = &map_text {
+            report.push(secrets::scan_text(context::DOCUMENT_NAME, map, 20));
+        }
         for path in &files {
             match project::resolve_within_root(&root, path)
                 .and_then(|absolute| std::fs::read_to_string(absolute).map_err(Into::into))
@@ -271,6 +333,7 @@ pub async fn export_preflight(
 
     Ok(ExportPreflight {
         file_count: bundle.file_count,
+        project_map_included: bundle.project_map_range.is_some(),
         byte_len: bundle.byte_len,
         estimate_label: bundle.estimate.kind.label(),
         estimate: bundle.estimate,
@@ -305,6 +368,9 @@ pub async fn export_bundle(
     state: State<'_, AppState>,
     request: ExportRequest,
 ) -> AppResult<ExportResponse> {
+    let map_text = project_map(&state, &request.options)
+        .await?
+        .map(|(_, markdown)| markdown);
     let session = state.require_session()?;
     let settings = state.settings();
     let resolved = selection::resolve(&session.inventory, &request.selection, &settings.policy)?;
@@ -314,7 +380,13 @@ pub async fn export_bundle(
     let options = request.options.clone();
     let build_resolved = resolved.clone();
     let bundle = tauri::async_runtime::spawn_blocking(move || {
-        concat::build(&root, &inventory, &build_resolved, &options)
+        concat::build_with_map(
+            &root,
+            &inventory,
+            &build_resolved,
+            &options,
+            map_text.as_deref(),
+        )
     })
     .await
     .map_err(|error| AppError::internal(format!("bundle task failed: {error}")))??;
@@ -380,6 +452,7 @@ pub async fn export_bundle(
                 "estimate": bundle.estimate.value,
                 "estimateKind": estimate_kind,
                 "includedFiles": resolved.files,
+                "projectMapIncluded": bundle.project_map_range.is_some(),
             }),
             "succeeded",
         )?;
@@ -503,4 +576,42 @@ pub async fn clear_bundle_history(state: State<'_, AppState>) -> AppResult<usize
 pub async fn audit_log(state: State<'_, AppState>) -> AppResult<Vec<serde_json::Value>> {
     let session = state.require_session()?;
     state.with_db(|connection| repositories::list_audit(connection, &session.record.id, 100))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle(text: &str, map: Option<(usize, usize)>) -> Bundle {
+        Bundle {
+            text: text.to_string(),
+            output_hash: "h".into(),
+            estimate: tokenizer::estimate(text),
+            contributions: Vec::new(),
+            truncations: Vec::new(),
+            skipped: Vec::new(),
+            byte_len: text.len() as u64,
+            file_count: 1,
+            project_map_tokens: if map.is_some() { 7 } else { 0 },
+            project_map_range: map,
+        }
+    }
+
+    #[test]
+    fn preview_leaves_out_the_map_but_keeps_its_numbers() {
+        let text = "# Project Context\n\n---\n\n===== a.ts =====\nx\n";
+        let map_end = "# Project Context\n\n---\n\n".len();
+        let preview = preview_of(bundle(text, Some((0, map_end))), None);
+        assert_eq!(preview.preview, "===== a.ts =====\nx\n");
+        assert_eq!(preview.project_map_tokens, 7);
+        assert_eq!(
+            preview.byte_len,
+            text.len() as u64,
+            "numbers cover the whole bundle"
+        );
+
+        let plain = preview_of(bundle("===== a.ts =====\nx\n", None), Some(5));
+        assert!(plain.preview_truncated);
+        assert_eq!(plain.preview, "=====");
+    }
 }

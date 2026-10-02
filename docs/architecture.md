@@ -4,26 +4,32 @@
 
 ```text
 React + TypeScript (src/)
-  Project · Files · Bundle · Context · Settings
+  Overview · Context · Tasks (Ask LeanAI) · History · Models · Settings
   Zustand store · typed IPC client (src/ipc/client.ts)
                  │  invoke(command, { request })  →  typed response | AppError
                  ▼
 Tauri application layer (src-tauri/)
-  commands/   projects · bundles · context · settings · diagnostics
-  app_state   session, settings, cancellation, DB handle
+  commands/   projects · bundles · context · git · models · prompt · agent
+              settings · diagnostics
+  llm_client  Anthropic · OpenAI · llama-server sidecar · self-hosted servers
+  app_state   session, settings, cancellation, sidecar, keychain, DB handle
   db/         versioned migrations + repositories
                  │
                  ▼
 leanai-core (crates/leanai-core/)
   policy → walker → classify → inventory → selection → concat → manifest
   tokenizer · secrets · gitinfo · aiignore · symbols · context · benchmark
+  catalog · routing · llm_protocol · agent · approval · apply_gate · retrieval
                  │
-                 ├─ the approved project root (read-only, boundary-checked)
+                 ├─ the approved project root (boundary-checked)
                  └─ SQLite in the OS app-data directory
 ```
 
-Nothing else: no network client, no shell, no ambient filesystem scope. See
-ADR 0002.
+The webview holds no shell, HTTP or ambient filesystem capability (ADR 0002).
+The Rust backend reaches the network only for calls to model providers you
+configure (`llm_client`) and for GitHub operations you start, which run `git`,
+`ssh` and `curl` as child processes (`commands/git.rs`). Scanning, bundling,
+token estimation and the context index never use the network.
 
 ## Why the split
 
@@ -31,8 +37,8 @@ ADR 0002.
 classified, what a folder selection may include, how bytes are ordered in a
 bundle, how a token count is labelled, what a context section may claim.
 
-The consequence is that the rules are testable without a desktop app — 58 Rust
-tests run in under a second — and that adding a Tauri command cannot
+The consequence is that the rules are testable without a desktop app — the
+core crate's unit tests run in well under a second — and that adding a Tauri command cannot
 accidentally widen them. A command that wanted to bypass `selection::resolve`
 would have to reimplement classification, which is visible in review.
 
@@ -95,6 +101,39 @@ stable `code`, a display-safe `message`, an optional `recovery` sentence and a
 `retryable` flag. OS error strings are stripped of absolute paths before they
 reach the UI or a diagnostic bundle. The frontend renders `recovery` next to
 every error, so a failure always states the next action.
+
+## Prompt execution
+
+`commands/prompt.rs::run_prompt` is the one-box flow behind **Ask LeanAI**:
+
+```text
+analyze_prompt ─► plan_context_budget ─► select_model          (routing, no model)
+      │
+      ▼
+render_sections (PROJECT_CONTEXT, capped) ─► model loop:
+      read_files / search  ─► resolve_within_root, inventory checks, redaction
+      edit                 ─► build_proposal (exact find/replace, hashed diff)
+                           ─► validate_proposal (boundary, secrets, well-formed)
+      answer / insufficient
+      │
+      ▼
+apply_gate::decide ─► auto_apply  → TransactionalPatchSession → refresh context
+                  └─► confirm / careful_review → ApprovalRequest (bound to hash)
+```
+
+- **The model is untrusted input.** Every action is parsed and validated by
+  `llm_protocol::parse_action`. Agent turns also ask the provider to constrain
+  the reply to `llm_protocol::action_schema()`; that guarantees shape, not
+  meaning (ADR 0013).
+- **Escalation needs evidence.** The loop moves to the next stronger model only
+  on concrete failure: an unreachable or unavailable provider, repeated
+  invalid replies or edits, or the model reporting the task is beyond it.
+- **The apply gate** (`apply_gate.rs`) ranks each validated change as
+  `auto_apply`, `confirm` or `careful_review` with reasons. Its thresholds are
+  policy constants in that module, and every decision is stored with the run
+  (ADR 0013).
+- **Every run is recorded** in `runs` / `run_events`: the budget, retrievals,
+  searches, metrics, routing analysis, escalations and apply decision.
 
 ## Extension points for later phases
 

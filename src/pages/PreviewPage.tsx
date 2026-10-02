@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import { save } from "@tauri-apps/plugin-dialog";
 import { writeText } from "@tauri-apps/plugin-clipboard-manager";
 
 import {
@@ -12,17 +11,13 @@ import {
   formatNumber,
 } from "../components/primitives";
 import { api, toAppError } from "../ipc/client";
-import type { ExportDestination, ExportPreflight } from "../ipc/types";
+import type { ExportPreflight } from "../ipc/types";
 import { toSpec, useAppStore } from "../store/useAppStore";
 
 export function PreviewPage() {
   const store = useAppStore();
   const { bundle, building, selection, options } = store;
-  const [preflight, setPreflight] = useState<{
-    data: ExportPreflight;
-    destination: ExportDestination;
-    targetPath: string | null;
-  } | null>(null);
+  const [preflight, setPreflight] = useState<ExportPreflight | null>(null);
 
   // Rebuild after a debounce so option changes feel immediate without
   // rebuilding on every keystroke (FR-13).
@@ -43,19 +38,10 @@ export function PreviewPage() {
     );
   }
 
-  const startExport = async (destination: ExportDestination) => {
+  const startExport = async () => {
     try {
-      let targetPath: string | null = null;
-      if (destination === "file") {
-        targetPath = await save({
-          title: "Save bundle",
-          defaultPath: "leanai-bundle.md",
-          filters: [{ name: "Markdown", extensions: ["md", "txt"] }],
-        });
-        if (!targetPath) return;
-      }
-      const data = await api.exportPreflight(toSpec(selection), options, destination, targetPath);
-      setPreflight({ data, destination, targetPath });
+      const data = await api.exportPreflight(toSpec(selection), options, "clipboard", null);
+      setPreflight(data);
     } catch (error) {
       store.setError(toAppError(error));
     }
@@ -64,18 +50,9 @@ export function PreviewPage() {
   const confirmExport = async () => {
     if (!preflight) return;
     try {
-      const response = await api.exportBundle(
-        toSpec(selection),
-        options,
-        preflight.destination,
-        preflight.targetPath,
-      );
+      const response = await api.exportBundle(toSpec(selection), options, "clipboard", null);
       if (response.text !== null) await writeText(response.text);
-      store.setNotice(
-        response.writtenPath
-          ? `Saved to ${response.writtenPath} (manifest: ${response.manifestPath}).`
-          : "Bundle copied to the clipboard.",
-      );
+      store.setNotice("Context bundle copied to system clipboard.");
       setPreflight(null);
     } catch (error) {
       store.setError(toAppError(error));
@@ -88,11 +65,8 @@ export function PreviewPage() {
         title="Preview"
         actions={
           <>
-            <Button onClick={() => startExport("clipboard")} disabled={!bundle}>
+            <Button onClick={() => startExport()} disabled={!bundle}>
               Copy…
-            </Button>
-            <Button variant="primary" onClick={() => startExport("file")} disabled={!bundle}>
-              Save as…
             </Button>
           </>
         }
@@ -127,7 +101,8 @@ export function PreviewPage() {
               </div>
               <div className="mt-3 rounded-lg border border-ink-800 bg-ink-950/40 px-3 py-3">
                 <p className="text-xl font-semibold text-brand">
-                  ~{formatNumber(bundle.estimate.value)} <span className="text-sm font-normal text-ink-400">tokens</span>
+                  ~{formatNumber(bundle.estimate.value)}{" "}
+                  <span className="text-sm font-normal text-ink-400">tokens</span>
                 </p>
                 <p className="mt-1 text-[11px] text-ink-500">{bundle.estimateLabel}</p>
               </div>
@@ -223,7 +198,7 @@ export function PreviewPage() {
 
       {preflight ? (
         <ExportPreflightDialog
-          preflight={preflight.data}
+          preflight={preflight}
           onCancel={() => setPreflight(null)}
           onConfirm={confirmExport}
         />
@@ -264,7 +239,7 @@ function ExportPreflightDialog({
         <h2 id="preflight-title" className="text-base font-semibold text-white">
           Review Export
         </h2>
-        
+
         <div className="mt-4 grid grid-cols-3 gap-3">
           <Stat label="Files" value={formatNumber(preflight.fileCount)} />
           <Stat label="Size" value={formatBytes(preflight.byteLen)} />
@@ -284,7 +259,7 @@ function ExportPreflightDialog({
                 </Chip>
               </div>
             </div>
-            
+
             <ul className="mt-3 max-h-40 space-y-2 overflow-auto text-xs">
               {preflight.secretReport.findings.map((finding) => (
                 <li
@@ -299,7 +274,9 @@ function ExportPreflightDialog({
                       {finding.rule}
                     </Chip>
                   </div>
-                  <p className="mono mt-2 break-all text-ink-500 bg-ink-950 p-2 rounded">{finding.redactedExcerpt}</p>
+                  <p className="mono mt-2 break-all text-ink-500 bg-ink-950 p-2 rounded">
+                    {finding.redactedExcerpt}
+                  </p>
                 </li>
               ))}
             </ul>

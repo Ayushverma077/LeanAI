@@ -523,3 +523,114 @@ fn directory_summaries_roll_up_the_subtree() {
         .iter()
         .any(|summary| summary.selectable_files == 0));
 }
+
+/// The project map goes on top of the files, inside the hashed bundle, and
+/// only when the option asks for it (ADR 0015).
+#[test]
+fn project_map_is_placed_above_the_files_when_requested() {
+    let fixture = support::small_app();
+    let inventory = inventory_of(fixture.root());
+    let selection = selection::resolve(
+        &inventory,
+        &SelectionSpec::from_files(["src/greet.ts"]),
+        &Policy::default(),
+    )
+    .unwrap();
+    let map = "# Project Context: demo\r\n\r\n## Overview\r\n\r\n- **Languages:** typescript 2\r\n";
+    let with_map = BundleOptions {
+        include_project_map: true,
+        ..Default::default()
+    };
+
+    let plain = concat::build(fixture.root(), &inventory, &selection, &with_map).unwrap();
+    let mapped =
+        concat::build_with_map(fixture.root(), &inventory, &selection, &with_map, Some(map))
+            .unwrap();
+    let (start, end) = mapped.project_map_range.unwrap();
+    assert_eq!(start, 0);
+    assert_eq!(
+        &mapped.text[start..end],
+        "# Project Context: demo\n\n## Overview\n\n- **Languages:** typescript 2\n\n---\n\n",
+        "map is normalised to LF and separated from the files"
+    );
+    assert_eq!(&mapped.text[end..], plain.text, "files follow unchanged");
+    assert_ne!(mapped.output_hash, plain.output_hash);
+    assert_eq!(
+        mapped.estimate.value,
+        plain.estimate.value + mapped.project_map_tokens
+    );
+    assert_eq!(mapped.file_count, plain.file_count);
+    assert!(mapped
+        .contributions
+        .iter()
+        .all(|c| c.path != "PROJECT_CONTEXT.md"));
+
+    // Deterministic like any bundle.
+    let again =
+        concat::build_with_map(fixture.root(), &inventory, &selection, &with_map, Some(map))
+            .unwrap();
+    assert_eq!(again.output_hash, mapped.output_hash);
+
+    // The option off means no map, even if one is passed.
+    let ignored = concat::build_with_map(
+        fixture.root(),
+        &inventory,
+        &selection,
+        &BundleOptions::default(),
+        Some(map),
+    )
+    .unwrap();
+    assert!(ignored.project_map_range.is_none());
+    assert_eq!(ignored.project_map_tokens, 0);
+    assert!(!ignored.text.contains("Project Context"));
+}
+
+/// With front matter the map follows it; with no files the bundle is just the
+/// map, so it can be copied on its own.
+#[test]
+fn project_map_follows_front_matter_and_can_stand_alone() {
+    let fixture = support::small_app();
+    let inventory = inventory_of(fixture.root());
+    let map = "# Project Context\n\n## Overview\n\n- one line\n";
+
+    let files = selection::resolve(
+        &inventory,
+        &SelectionSpec::from_files(["src/greet.ts"]),
+        &Policy::default(),
+    )
+    .unwrap();
+    let with_front_matter = BundleOptions {
+        include_project_map: true,
+        include_front_matter: true,
+        ..Default::default()
+    };
+    let bundle = concat::build_with_map(
+        fixture.root(),
+        &inventory,
+        &files,
+        &with_front_matter,
+        Some(map),
+    )
+    .unwrap();
+    let (start, end) = bundle.project_map_range.unwrap();
+    assert!(bundle.text.starts_with("---\n"), "front matter stays first");
+    assert!(bundle.text[..start].contains("include_project_map: true"));
+    assert!(bundle.text[start..end].starts_with("# Project Context"));
+
+    let nothing =
+        selection::resolve(&inventory, &SelectionSpec::default(), &Policy::default()).unwrap();
+    let alone = concat::build_with_map(
+        fixture.root(),
+        &inventory,
+        &nothing,
+        &BundleOptions {
+            include_project_map: true,
+            ..Default::default()
+        },
+        Some(map),
+    )
+    .unwrap();
+    assert_eq!(alone.text, map);
+    assert_eq!(alone.file_count, 0);
+    assert_eq!(alone.project_map_range, Some((0, map.len())));
+}

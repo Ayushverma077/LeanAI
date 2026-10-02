@@ -6,7 +6,6 @@ import { StatusBar } from "./components/layout/StatusBar";
 import { TopBar } from "./components/layout/TopBar";
 import { Button } from "./components/primitives";
 import { onScanProgress } from "./ipc/client";
-import { AgentsPage } from "./pages/AgentsPage";
 import { ContextBundlerPage } from "./pages/ContextBundlerPage";
 import { HistoryPage } from "./pages/HistoryPage";
 import { ModelsPage } from "./pages/ModelsPage";
@@ -94,7 +93,6 @@ export default function App() {
             {route === "context" || route === "select" || route === "preview" ? (
               <ContextBundlerPage />
             ) : null}
-            {route === "agents" ? <AgentsPage /> : null}
             {route === "tasks" ? <TasksPage /> : null}
             {route === "history" ? <HistoryPage /> : null}
             {route === "models" ? <ModelsPage /> : null}

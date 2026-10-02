@@ -26,6 +26,8 @@ thiserror = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"] }
 uuid = { version = "1", features = ["v4"] }
+# HTTP client for provider calls (Anthropic, OpenAI, local llama-server).
+reqwest = { version = "0.13", features = ["json"] }
 
 [dev-dependencies]
 tempfile = "3"
